@@ -1,0 +1,6 @@
+# Upstream registry              Low Quay pull-through organisation
+docker.io                         docker-hub
+ghcr.io                           ghcr
+quay.io                           quay-io
+registry.k8s.io                   registry-k8s
+mcr.microsoft.com                 mcr

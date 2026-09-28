@@ -1,0 +1,7 @@
+.mirror-work/
+delta/
+inbox/
+__pycache__/
+*.pyc
+.agent/
+.agents/
