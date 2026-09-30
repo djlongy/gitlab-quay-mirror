@@ -1,0 +1,41 @@
+---
+name: verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests and catalog
+        run: |
+          python3 mirror.py targets
+          python3 -m unittest discover -s tests -v
+      - name: Install registry-copy tool
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y skopeo
+      - name: Disposable low and high registries
+        run: |
+          docker run -d --name low -p 127.0.0.1:15000:5000 registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          docker run -d --name high -p 127.0.0.1:15001:5000 registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          printf '{"auths":{}}\n' > /tmp/mirror-test-auth.json
+          curl --retry 10 --retry-delay 1 --retry-connrefused --fail http://127.0.0.1:15000/v2/
+          curl --retry 10 --retry-delay 1 --retry-connrefused --fail http://127.0.0.1:15001/v2/
+      - name: Real multi-platform mirror, transfer, import and recovery
+        env:
+          LOW_QUAY: 127.0.0.1:15000
+          HIGH_QUAY: 127.0.0.1:15001
+          LOW_AUTH_FILE: /tmp/mirror-test-auth.json
+          HIGH_AUTH_FILE: /tmp/mirror-test-auth.json
+          LOW_TLS_VERIFY: 'false'
+          HIGH_TLS_VERIFY: 'false'
+          E2E_FIXTURES: 'true'
+        run: python3 tests/e2e.py

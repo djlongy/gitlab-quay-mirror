@@ -1,26 +1,50 @@
+---
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
 
-stages: [check, sync]
+stages: [verify, publish]
+variables:
+  PYTHON_IMAGE: 'docker.io/python@sha256:cd7c412d000912f29075a1b8803e43cb2f38bb67f104019df526df5ceaf30569'
+  MIRROR_FULL: 'false'
 
-# Use a runner with Python 3.11+, skopeo, and a persistent MIRROR_WORK/MIRROR_OUTBOX mount.
-# The outbox is the NiFi or SMB pickup point; image bundles can exceed GitLab's artifact limit.
-default:
-  tags: [quay-mirror]
-
-check:
-  stage: check
+verify:
+  stage: verify
+  image: $PYTHON_IMAGE
+  dependencies: []
   script:
     - python3 mirror.py targets
-    - python3 -m unittest discover -s tests
+    - python3 -m unittest discover -s tests -v
 
+# A protected shell runner with persistent MIRROR_WORK and MIRROR_OUTBOX.
+# Merge-request validation runs elsewhere, without registry credentials or state mounts.
 sync:
-  stage: sync
+  stage: publish
+  environment:
+    name: mirror-low
+    action: prepare
+  tags: [quay-mirror]
   resource_group: quay-mirror
+  needs:
+    - job: verify
+      artifacts: false
   script:
-    - python3 mirror.py sync
+    - test -n "$MIRROR_WORK" && test -n "$MIRROR_OUTBOX"
+    - |
+      if [ "$MIRROR_FULL" = "true" ]; then
+        python3 mirror.py sync --full
+      else
+        python3 mirror.py sync
+      fi
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "schedule"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(push|web|api)$/
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE =~ /^(schedule|web|api)$/'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - images.txt
+        - mirror.py
+        - .gitlab-ci.yml

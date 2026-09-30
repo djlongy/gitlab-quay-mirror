@@ -1,0 +1,28 @@
+---
+# Select this file as the CI configuration path in a separate high-side project.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE =~ /^(schedule|web|api)$/'
+
+stages: [verify, publish]
+default:
+  tags: [quay-mirror-high]
+
+verify:
+  stage: verify
+  dependencies: []
+  script:
+    - python3 -m unittest discover -s tests -v
+
+import:
+  stage: publish
+  environment:
+    name: mirror-high
+    action: prepare
+  resource_group: quay-mirror-high
+  needs:
+    - job: verify
+      artifacts: false
+  script:
+    - test -n "$IMPORT_WORK" && test -n "$MIRROR_INBOX"
+    - python3 mirror.py import --inbox "$MIRROR_INBOX"
