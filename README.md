@@ -1,34 +1,51 @@
 # gitlab-quay-mirror
 
-Mirrors approved container tags from low Quay proxy organisations to high Quay with `python3 mirror.py sync`.
+Mirrors reviewed images into low Quay and exports offline bundles for high Quay. [Quickstart](QUICKSTART.md).
 
 ## Requirements
 
-- Python 3.11+, skopeo, and a low-side runner with a persistent work and outbox directory.
-- The high side needs Python 3.11+, skopeo, and a Quay account that can push to the target organisation.
+- Python 3.11+ and skopeo 1.13+ on each side; no Docker daemon or privileged runner.
+- GitLab with an unprivileged Docker runner for verification and a protected shell runner tagged `quay-mirror` for sync.
+- For scheduled high-side import, a separate project with CI configuration path `.gitlab-ci-high.yml` and a protected shell runner tagged `quay-mirror-high`.
 
-## Flags
+## Inputs
 
-The full command set is in `python3 mirror.py --help`; registry mapping is in `proxy-orgs.txt`.
+`mirror.py --help`, `.gitlab-ci.yml` and `.gitlab-ci-high.yml` define the command and pipeline interfaces.
 
 | Req | Name | Default | Purpose |
 |---|---|---|---|
-| Required | `LOW_QUAY`, `LOW_AUTH_FILE` | none | Low Quay host and skopeo auth file for `sync` |
-| Required | `HIGH_QUAY`, `HIGH_AUTH_FILE` | none | High Quay host and skopeo auth file for `import` |
-| Optional | `MIRROR_WORK` | `.mirror-work/` | Persistent record of sent tag digests |
-| Optional | `MIRROR_OUTBOX` | `delta/` | Bundle pickup directory |
-| Optional | `NIFI_URL` | unset | POST each completed bundle to NiFi |
-| Optional | `LOW_TLS_VERIFY`, `HIGH_TLS_VERIFY` | `true` | Set `false` only for an HTTP lab registry |
+| For sync | `LOW_QUAY` | none | Low hosted registry, as `host[:port]` |
+| For import | `HIGH_QUAY` | none | High hosted registry, as `host[:port]` |
+| In low CI | `MIRROR_WORK` | `.mirror-work/` locally | Persistent sender ledger; one writer per directory |
+| In low CI | `MIRROR_OUTBOX` | `delta/` locally | Persistent transfer pickup directory |
+| In high CI | `IMPORT_WORK` | `.import-work/` locally | Persistent receipt ledger and replay guard |
+| In high CI | `MIRROR_INBOX` | none | Directory holding transferred archive/checksum pairs |
+| Optional | `MIRROR_FULL` | `false` | Set `true` on Run pipeline to resend every approved image |
+| Optional | `NIFI_URL` | none | HTTP(S) listener receiving both files by POST with a `Filename` header |
+
+## Secrets
+
+Use protected GitLab **File** variables containing skopeo auth JSON, scoped to environment `mirror-low` or `mirror-high`. The script receives a file path; verification jobs receive no registry secrets.
+
+| Variable | When | Purpose |
+|---|---|---|
+| `UPSTREAM_AUTH_FILE` | Private or rate-limited upstreams | Pull credentials for upstream registries |
+| `LOW_AUTH_FILE` | Sync | Push/pull credentials scoped to the low target organisation |
+| `HIGH_AUTH_FILE` | Import | Push/pull credentials scoped to the high target organisation |
+
+Locally, create each file with `skopeo login --authfile /path/to/auth.json <registry>`.
+Keep credentials out of `images.txt`, Git and transfer bundles.
 
 ## Minimum configuration
 
-Add one line per approved tag to `images.txt`:
+Your `images.txt` has one pinned upstream image and one destination per line:
 
 ```text
-docker.io/library/alpine:3.20.3@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a mirror/library/alpine
+docker.io/library/alpine:3.20.3@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a mirror/library--alpine
 ```
 
-The digest must be 64 lowercase hex characters. `renovate.json` updates the upstream tag and its digest. `proxy-orgs.txt` maps the upstream registry to a low Quay pull-through organisation. Each target organisation must exist on high Quay.
+Both Quays use the destination `mirror/library--alpine:3.20.3`. Quay targets have exactly one slash.
+`python3 mirror.py add <registry/repo:tag> <org/repo>` resolves and appends the digest for you.
 
 ## Usage
 
@@ -38,25 +55,35 @@ python3 mirror.py sync
 
 ## Preconditions
 
-- Log in to each Quay with `skopeo login --authfile <path> <host>` and set the matching auth-file variable.
-- The low runner can pull from the proxy organisations. The high-side account can push to each target organisation.
-- CI uses a `quay-mirror` runner with persistent `MIRROR_WORK` and `MIRROR_OUTBOX` paths. `resource_group` serialises sync jobs.
-- If `NIFI_URL` is set, its listener writes both posted files unchanged into the high-side inbox.
+- Create the target organisation on each Quay. Put its robot in a Creator team so new catalog repositories can be created, or pre-create repositories and grant the robot push/pull access.
+- Protect the default branch and mirror runner. Merge-request verification uses no mirror credentials or persistent state.
+- Enable Renovate on the GitLab copy. It queries upstream registries, proposes tag/digest changes in `images.txt`, and requires your review before merge.
+- Create a nightly GitLab schedule against the protected default branch. Schedules mirror the reviewed catalog; they do not approve Renovate updates.
+- Mount persistent sender, outbox and receipt directories. Use separate sender state for separate low registries.
+- Provision registry trust through the host's containers certificate configuration; keep TLS verification enabled outside disposable labs.
 
 ## Behaviour
 
-- `sync` verifies each tag against its approved digest, then copies every platform with `skopeo --all --preserve-digests` into one OCI layout. It bundles tags whose digest has changed since the last successful run.
-- A rerun with no changes sends nothing. `sync --full` bundles every declared tag after a lost transfer.
-- Each `quay-delta-*.tar` has a `.sha256` sidecar. Move both through NiFi or an SMB share. `NIFI_URL` POSTs the sidecar, then the tar; a failed POST leaves both files and fails the sync.
-- `import <bundle>` verifies the checksum, pushes every tag to high Quay, and reads each manifest back to verify its digest. `import --inbox <dir>` processes complete bundles and moves successes to `done/`.
-- The transfer delta is at the **tag/image** level. A new image sends its layers even if an older pack carried some of them. Add blob-level state only if measured transfer volume requires it.
+Default-branch catalog/script/pipeline changes, schedules and Run pipeline run sync after verification.
+Every sync verifies tagged low-side copies and copies new or changed approved digests; unchanged entries need no upstream pull.
+Only changed target/tag/digest entries enter the archive. Each archive contains complete image content for those entries, including all platforms.
+
+Carry the `.tar` and matching `.sha256` together. Import checks the archive, every referenced OCI blob and expected image digest before pushing.
+`python3 mirror.py import --inbox /path/to/inbox` processes ready bundles in order and moves successful pairs to `done/`.
+Missing checksums wait; missing sequence numbers, conflicting replays and corrupt content fail.
+A missed transfer is recovered with `python3 mirror.py sync --full`; deleting sender state requires a reviewed full bundle and `import --adopt-stream`.
+
+For Helm workloads, render the chart with your actual values and add the resulting image references to the catalog.
+A chart version or `appVersion` is not a complete list of its images, init containers or hooks.
 
 ## Out of scope
 
-- Deleting high-side tags that disappear from `images.txt`.
-- Transferring detached signatures, SBOM referrers, or vulnerability scans.
-- Creating Quay organisations or the physical diode flow.
+- Removing old tags, mirroring every upstream tag, or deploying Helm charts.
+- Detached signatures/referrers, scanning and cross-domain release approval; a checksum proves integrity, not sender authenticity.
+- Configuring the physical transfer link, NiFi flow, GitLab schedules or Renovate service.
 
 ## Expected result
 
-After import, `<HIGH_QUAY>/<target>:<tag>` has the same manifest digest as the approved `images.txt` entry. Verify with `skopeo inspect --raw docker://<high-quay>/<target>:<tag> | sha256sum`.
+Sync prints a bundle path, or `nothing to send; low-side digests verified`.
+High-side import prints `digests verified` after reading the destination manifests back.
+Verify the catalog at either end with `python3 mirror.py targets`.

@@ -5,3 +5,9 @@ __pycache__/
 *.pyc
 .agent/
 .agents/
+.import-work/
+.e2e*
+.auth/
+*.auth.json
+*.tar
+*.tar.sha256
