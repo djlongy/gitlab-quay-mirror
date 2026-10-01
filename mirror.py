@@ -212,6 +212,18 @@ def platform_digest(reference, digest, side):
     return matches[0]
 
 
+def verify_platform(directory, image):
+    """A platform image must be a child of the approved index carried beside it."""
+    if image["transfer"] == image["digest"]:
+        return
+    path = directory / f"{image['digest'][7:]}.manifest.json"
+    if not path.is_file() or sha256(path) != image["digest"][7:]:
+        raise MirrorError(f"missing or corrupt approved index: {image['digest']}")
+    children = json.loads(path.read_bytes()).get("manifests", [])
+    if image["transfer"] not in [child.get("digest") for child in children]:
+        raise MirrorError(f"{image['transfer']} is not part of approved {image['digest']}")
+
+
 def notify(bundle):
     url = os.environ.get("NIFI_URL")
     if url:
@@ -276,6 +288,12 @@ def sync(path, full=False):
                     # dir: keeps a Docker manifest list byte for byte; oci: would have to convert it.
                     copy(f"docker://{low}/{image['target']}@{image['transfer']}", f"dir:{directory}", "LOW_QUAY")
                     verify_image(directory, image["transfer"])
+                if image["transfer"] != image["digest"]:
+                    # Carry the approved index so import can prove the platform image belongs to it.
+                    index = run("skopeo", "inspect", "--raw", *options("UPSTREAM"),
+                                "docker://" + transport_reference(image["source"]))
+                    (directory / f"{image['digest'][7:]}.manifest.json").write_bytes(index)
+                    verify_platform(directory, image)
             write_json(stage / "images.json", {"schema": 1, "stream": state["stream"],
                        "sequence": state["sequence"], "full": full, "images": changed})
             bundle = outbox / f"quay-{state['stream']}-{state['sequence']:012d}.tar"
@@ -352,6 +370,7 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
         validate_manifest(manifest)
         for image in manifest["images"]:
             verify_image(stage / "images" / image["transfer"].replace(":", "-"), image["transfer"])
+            verify_platform(stage / "images" / image["transfer"].replace(":", "-"), image)
         receipt_file = work / "received.json"
         receipt = json.loads(receipt_file.read_text()) if receipt_file.exists() else {}
         if receipt and receipt.get("registry") != high:

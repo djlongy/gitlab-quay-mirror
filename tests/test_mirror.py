@@ -230,6 +230,18 @@ class MirrorTest(unittest.TestCase):
                     mock.patch.dict(os.environ, {'MIRROR_PLATFORM': 'linux/amd64'}):
                 self.assertEqual(mirror.platform_digest('docker://low/x@' + pinned, pinned, 'UPSTREAM'), pinned)
 
+    def test_platform_image_must_belong_to_the_approved_index(self):
+        image, _ = fixture(self.stage)
+        directory = self.stage / 'images' / image['transfer'].replace(':', '-')
+        index = json.dumps({'schemaVersion': 2, 'manifests': [{'digest': image['transfer']}]}).encode()
+        approved = 'sha256:' + hashlib.sha256(index).hexdigest()
+        (directory / f'{approved[7:]}.manifest.json').write_bytes(index)
+        platform = image | {'source': 'docker.io/library/alpine:3.20@' + approved, 'digest': approved}
+        mirror.verify_platform(directory, platform)
+        for forged in ({'transfer': 'sha256:' + 'e'*64}, {'digest': 'sha256:' + 'f'*64}):
+            with self.subTest(forged=forged), self.assertRaises(mirror.MirrorError):
+                mirror.verify_platform(directory, platform | forged)
+
     def test_concurrent_work_is_refused(self):
         with mirror.locked(self.root / 'work'):
             with self.assertRaisesRegex(mirror.MirrorError, 'another mirror process'):
