@@ -26,16 +26,13 @@ jobs:
         run: |
           docker run -d --name low -p 127.0.0.1:15000:5000 registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
           docker run -d --name high -p 127.0.0.1:15001:5000 registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
-          printf '{"auths":{}}\n' > /tmp/mirror-test-auth.json
           curl --retry 10 --retry-delay 1 --retry-connrefused --fail http://127.0.0.1:15000/v2/
           curl --retry 10 --retry-delay 1 --retry-connrefused --fail http://127.0.0.1:15001/v2/
       - name: Real multi-platform mirror, transfer, import and recovery
         env:
-          LOW_QUAY: 127.0.0.1:15000
-          HIGH_QUAY: 127.0.0.1:15001
-          LOW_AUTH_FILE: /tmp/mirror-test-auth.json
-          HIGH_AUTH_FILE: /tmp/mirror-test-auth.json
-          LOW_TLS_VERIFY: 'false'
-          HIGH_TLS_VERIFY: 'false'
+          LOW_QUAY_HOST: 127.0.0.1:15000
+          HIGH_QUAY_HOST: 127.0.0.1:15001
+          LOW_QUAY_TLS_VERIFY: 'false'
+          HIGH_QUAY_TLS_VERIFY: 'false'
           E2E_FIXTURES: 'true'
         run: python3 tests/e2e.py

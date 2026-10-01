@@ -3,7 +3,7 @@ title: Image mirror workflow
 type: reference
 status: implemented
 tags: [quay, oci, gitlab-ci, offline-transfer]
-updated: 2026-09-30
+updated: 2026-10-01
 ---
 
 # Image mirror workflow
@@ -20,11 +20,11 @@ A Helm repository may propose a catalog change after its Renovate chart update i
 
 ## Transfer and recovery
 
-A bundle holds an OCI image layout and `images.json`. The metadata declares a sender stream, increasing sequence number, full/delta flag and source/destination/digest mappings. Files are written to temporary names; the final checksum file is the readiness marker.
+A bundle holds one skopeo `dir:` copy per image digest and `images.json`. An `oci:` layout cannot hold a Docker manifest list with its digest preserved, because skopeo must convert the list to an OCI index; `dir:` stores the manifest bytes unchanged. The metadata declares a sender stream, increasing sequence number, full/delta flag and source/destination/digest mappings. `transfer` is the digest carried: the approved digest, or its `MIRROR_PLATFORM` child. Files are written to temporary names; the final checksum file is the readiness marker.
 
 The sender reserves its sequence before publication. An interrupted export or failed HTTP delivery forces the next export to be full. The sender ledger records export, never proof of high-side receipt. A lost bundle therefore requires `sync --full`. A full bundle carries every current approved entry and may bridge a sequence gap.
 
-Import validates every archive path, metadata entry, referenced blob size/hash and image-root digest before any registry push. It then copies all platforms with digest preservation, reads the high-side manifests back and commits the receipt only after all pushes verify. A partially failed import can be retried. The registry may contain some completed copies, but no successful receipt is recorded prematurely.
+Import validates every archive path, metadata entry, manifest, config and layer before any registry push. It then copies each image with digest preservation, reads the high-side manifests back and commits the receipt only after all pushes verify. A partially failed import can be retried. The registry may contain some completed copies, but no successful receipt is recorded prematurely.
 
 Identical retransmission is a no-op. Older or conflicting sequences cannot roll tags back. A different stream requires explicit adoption of a reviewed full bundle. Sender state, receipt state and outbox files are persistent operational data, not GitLab caches.
 
@@ -43,7 +43,7 @@ GitHub does not schedule production mirroring into private registries. Import th
 - [Skopeo copy: all platforms and digest preservation](https://github.com/containers/skopeo/blob/main/docs/skopeo-copy.1.md)
 - [Renovate Docker versions and digests](https://docs.renovatebot.com/docker/)
 - [Renovate Helm values manager](https://docs.renovatebot.com/modules/manager/helm-values/)
-- [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md)
+- [Skopeo dir transport](https://github.com/containers/image/blob/main/docs/containers-transports.5.md)
 
 ## Verification
 
@@ -54,5 +54,12 @@ Verified on 2026-09-30:
 - `E2E_FIXTURES=true python3 tests/e2e.py` passed against the two Quays with reproducible `amd64`/`arm64` images. It exercised version 1.0.0 to 1.0.1, no-change sync, a lost delta, full recovery, replay/corruption rejection and inbox completion. Fixtures avoid public-registry rate limits in CI.
 - Renovate 44.121.4 validated the configuration and extracted the active catalog reference, tag and digest in a local extraction-only run.
 - GitLab's project CI Lint API accepted both pipeline files without warnings. This is syntax/merged-config evidence, not execution of a scheduled GitLab job.
+
+Verified on 2026-10-01, Quay 3.15.7 low and high, Skopeo 1.22.2, Python 3.13, as a non-root Linux user whose only credentials came from `skopeo login`:
+
+- `tests/e2e.py` passed with `E2E_FIXTURES=true`, and with real Docker Hub `prom/prometheus` v3.13.3 then v3.13.4. Prometheus is a Docker manifest list, the format the `oci:` layout failed on; all six platforms and the index digest reached high Quay. Destinations were nested (`<org>/<path>/image`).
+- `MIRROR_PLATFORM=linux/amd64 tests/matrix.py` passed for ten references: `prom/prometheus` (Docker list), `alpine` (OCI index with attestations), `quay.io/prometheus/node-exporter`, `ghcr.io/stefanprodan/podinfo`, `registry.k8s.io/pause` (Windows children), `amd64/alpine`, `bitnami/redis:latest`, `bitnami/redis:latest` pinned to an older digest, a `sha256-<hex>` referrers index tag and a cosign `.sig` tag. The bundle was 253 MB.
+- All platforms passed for `alpine`, old `bitnami/redis:latest` and the referrers index. `registry.k8s.io/pause` failed at low Quay with `manifest invalid` on its Windows child.
+- Renovate 44.112.3 with `renovate.json`, `--platform=local --dry-run=lookup`: an old `bitnami/redis:latest` digest received a digest update to the current `latest`, and `prom/prometheus:v3.13.3` a minor update to v3.15.0.
 
 The test transfer uses a filesystem inbox, not a physical diode. Production schedules, scoped robot credentials, protected runners and transfer pickup remain operator configuration. `NIFI_URL` delivery is optional; the Quay proof does not claim a live NiFi delivery.

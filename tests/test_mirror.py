@@ -14,25 +14,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mirror
 
 
-def blob(layout, data):
+def blob(directory, data, name='{}'):
     payload = json.dumps(data).encode()
     digest = hashlib.sha256(payload).hexdigest()
-    path = layout / 'blobs' / 'sha256' / digest
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name.format(digest)).write_bytes(payload)
     return {'digest': 'sha256:' + digest, 'size': len(payload)}
 
 
+def image_manifest(directory, name='{}'):
+    config = blob(directory, {'architecture': 'amd64', 'os': 'linux'})
+    layer = blob(directory, {'test': 'layer'})
+    return blob(directory, {'schemaVersion': 2, 'config': config, 'layers': [layer]}, name), layer
+
+
+def place(stage, directory, root):
+    """Name a skopeo dir: copy after its root digest, as sync does."""
+    (directory / 'manifest.json').write_bytes((directory / root['digest'][7:]).read_bytes())
+    (directory / root['digest'][7:]).unlink()
+    final = stage / 'images' / root['digest'].replace(':', '-')
+    final.parent.mkdir(parents=True, exist_ok=True)
+    directory.rename(final)
+    (final / 'version').write_text('Directory Transport Version: 1.1\n')
+    return final
+
+
 def fixture(stage):
-    layout = stage / 'oci'
-    config = blob(layout, {'architecture': 'amd64', 'os': 'linux'})
-    layer = blob(layout, {'test': 'layer'})
-    root = blob(layout, {'schemaVersion': 2, 'config': config, 'layers': [layer]})
-    root['annotations'] = {mirror.OCI_REF: root['digest'].replace(':', '-')}
-    (layout / 'oci-layout').write_text('{"imageLayoutVersion":"1.0.0"}')
-    (layout / 'index.json').write_text(json.dumps({'schemaVersion': 2, 'manifests': [root]}))
+    root, layer = image_manifest(stage / 'building')
+    place(stage, stage / 'building', root)
     image = mirror.parse_image('docker.io/library/alpine:3.20@' + root['digest'], 'mirror/alpine')
-    return image, layer
+    return image | {'transfer': root['digest']}, layer
 
 
 def pack(stage, destination, sequence=1, full=True, image=None, stream='a' * 32):
@@ -56,17 +67,18 @@ class MirrorTest(unittest.TestCase):
         self.stage = self.root / 'stage'
         self.stage.mkdir()
         self.env = mock.patch.dict(os.environ, {
-            'LOW_QUAY': 'low.example.internal', 'LOW_AUTH_FILE': '/low-auth.json',
-            'HIGH_QUAY': 'high.example.internal', 'HIGH_AUTH_FILE': '/high-auth.json',
-            'MIRROR_WORK': str(self.root / 'work'), 'MIRROR_OUTBOX': str(self.root / 'out'),
-            'IMPORT_WORK': str(self.root / 'import'),
+            'LOW_QUAY_HOST': 'low.example.internal', 'HIGH_QUAY_HOST': 'high.example.internal',
+            'MIRROR_STATE_DIR': str(self.root / 'work'), 'MIRROR_BUNDLE_DIR': str(self.root / 'out'),
+            'IMPORT_STATE_DIR': str(self.root / 'import'),
         }, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
 
-    def test_catalog_requires_one_quay_repository_level_and_a_digest(self):
+    def test_catalog_requires_a_digest_and_an_org_and_repository(self):
+        pinned = 'docker.io/library/alpine:3.20@sha256:' + 'a'*64
+        self.assertEqual(mirror.parse_image(pinned, 'team-dev/library/alpine')['target'], 'team-dev/library/alpine')
         for source, target in [('docker.io/library/alpine:3.20', 'mirror/alpine'),
-                               ('docker.io/library/alpine:3.20@sha256:' + 'a'*64, 'mirror/library/alpine'),
+                               (pinned, 'alpine'), (pinned, 'mirror/../alpine'), (pinned, 'mirror//alpine'),
                                ('docker.io/../alpine:3.20@sha256:' + 'a'*64, 'mirror/alpine')]:
             with self.subTest(source=source, target=target), self.assertRaises(mirror.MirrorError):
                 mirror.parse_image(source, target)
@@ -79,43 +91,49 @@ class MirrorTest(unittest.TestCase):
 
     def test_add_resolves_a_pin(self):
         path = self.root / 'images.txt'
-        with mock.patch.object(mirror, 'raw_digest', return_value='sha256:' + 'a'*64):
-            mirror.add_image(path, 'docker.io/library/alpine:3.20', 'mirror/library--alpine')
-        self.assertEqual(mirror.catalog(path)[0]['digest'], 'sha256:' + 'a'*64)
+        with mock.patch.object(mirror, 'raw_digest', return_value='sha256:' + 'a'*64) as lookup:
+            mirror.add_image(path, 'prom/prometheus:v3.13.4', 'team-dev/prom/prometheus')
+        lookup.assert_called_once_with('docker://docker.io/prom/prometheus:v3.13.4', 'UPSTREAM')
+        self.assertEqual(path.read_text(), 'docker.io/prom/prometheus:v3.13.4@sha256:' + 'a'*64 + ' team-dev/prom/prometheus\n')
+        self.assertEqual(mirror.normalise('alpine:3.20'), 'docker.io/library/alpine:3.20')
+        self.assertEqual(mirror.normalise('quay.io/org/image:1'), 'quay.io/org/image:1')
+        self.assertEqual(mirror.normalise('localhost:5000/image:1'), 'localhost:5000/image:1')
 
     def test_skopeo_transport_omits_tag_but_keeps_port_and_digest(self):
         reference = 'registry.example.internal:5000/team/image:1.0@sha256:' + 'a'*64
         self.assertEqual(mirror.transport_reference(reference),
                          'registry.example.internal:5000/team/image@sha256:' + 'a'*64)
 
-    def test_nested_platform_blobs_are_verified(self):
-        image, layer = fixture(self.stage)
-        layout = self.stage / 'oci'
-        child = json.loads((layout / 'index.json').read_text())['manifests'][0]
-        root = blob(layout, {'schemaVersion': 2, 'manifests': [child]})
-        root['annotations'] = {mirror.OCI_REF: root['digest'].replace(':', '-')}
-        (layout / 'index.json').write_text(json.dumps({'manifests': [root]}))
-        image = mirror.parse_image('docker.io/library/alpine:3.20@' + root['digest'], 'mirror/alpine')
-        mirror.verify_layout(layout, [image])
-        (layout / 'blobs' / 'sha256' / layer['digest'][7:]).write_text('corrupt')
-        with self.assertRaisesRegex(mirror.MirrorError, 'corrupt OCI blob'):
-            mirror.verify_layout(layout, [image])
+    def test_manifest_list_children_and_blobs_are_verified(self):
+        building = self.stage / 'building'
+        child, layer = image_manifest(building, '{}.manifest.json')
+        child['platform'] = {'architecture': 'amd64', 'os': 'linux'}
+        root = blob(building, {'schemaVersion': 2, 'manifests': [child]})
+        directory = place(self.stage, building, root)
+        mirror.verify_image(directory, root['digest'])
+        (directory / layer['digest'][7:]).write_text('corrupt')
+        with self.assertRaisesRegex(mirror.MirrorError, 'corrupt image file'):
+            mirror.verify_image(directory, root['digest'])
+        (directory / layer['digest'][7:]).unlink()
+        with self.assertRaisesRegex(mirror.MirrorError, 'corrupt image file'):
+            mirror.verify_image(directory, root['digest'])
 
     def test_import_rejects_corrupt_content_even_with_recomputed_archive_checksum(self):
         image, layer = fixture(self.stage)
-        (self.stage / 'oci/blobs/sha256' / layer['digest'][7:]).write_text('bad')
+        (self.stage / 'images' / image['digest'].replace(':', '-') / layer['digest'][7:]).write_text('bad')
         bundle = self.root / 'quay-bad.tar'
         pack(self.stage, bundle, image=image)
-        with mock.patch.object(mirror, 'copy') as push, self.assertRaisesRegex(mirror.MirrorError, 'corrupt OCI blob'):
+        with mock.patch.object(mirror, 'copy') as push, self.assertRaisesRegex(mirror.MirrorError, 'corrupt image file'):
             mirror.import_one(bundle)
         push.assert_not_called()
 
     def test_metadata_digest_substitution_fails_before_push(self):
         image, _ = fixture(self.stage)
         image = mirror.parse_image('docker.io/library/alpine:3.20@sha256:' + 'f'*64, 'mirror/alpine')
+        image['transfer'] = image['digest']
         bundle = self.root / 'quay-wrong.tar'
         pack(self.stage, bundle, image=image)
-        with mock.patch.object(mirror, 'copy') as push, self.assertRaisesRegex(mirror.MirrorError, 'OCI root'):
+        with mock.patch.object(mirror, 'copy') as push, self.assertRaisesRegex(mirror.MirrorError, 'corrupt image file'):
             mirror.import_one(bundle)
         push.assert_not_called()
 
@@ -188,6 +206,30 @@ class MirrorTest(unittest.TestCase):
                 with self.assertRaisesRegex(mirror.MirrorError, 'unsafe or duplicate'):
                     mirror.extract(bundle, self.stage)
 
+    def test_state_defaults_to_the_home_directory(self):
+        with mock.patch.dict(os.environ, {'HOME': str(self.root)}, clear=True):
+            self.assertEqual(mirror.state_path('MIRROR_STATE_DIR', 'quay-mirror'), self.root / '.local/state/quay-mirror')
+
+    def test_platform_selection_picks_one_child_or_fails(self):
+        child = {'digest': 'sha256:' + 'b'*64, 'platform': {'os': 'linux', 'architecture': 'amd64'}}
+        arm = {'digest': 'sha256:' + 'c'*64, 'platform': {'os': 'linux', 'architecture': 'arm', 'variant': 'v7'}}
+        attestation = {'digest': 'sha256:' + 'd'*64, 'platform': {'os': 'unknown', 'architecture': 'unknown'}}
+        listing = json.dumps({'schemaVersion': 2, 'manifests': [child, arm, attestation]}).encode()
+        pinned = 'sha256:' + 'a'*64
+        with mock.patch.object(mirror, 'run', return_value=listing):
+            self.assertEqual(mirror.platform_digest('docker://low/x@' + pinned, pinned, 'UPSTREAM'), pinned)
+            for wanted, expected in (('linux/amd64', child['digest']), ('linux/arm/v7', arm['digest'])):
+                with mock.patch.dict(os.environ, {'MIRROR_PLATFORM': wanted}):
+                    self.assertEqual(mirror.platform_digest('docker://low/x@' + pinned, pinned, 'UPSTREAM'), expected)
+            with mock.patch.dict(os.environ, {'MIRROR_PLATFORM': 'linux/s390x'}), \
+                    self.assertRaisesRegex(mirror.MirrorError, 'found 0'):
+                mirror.platform_digest('docker://low/x@' + pinned, pinned, 'UPSTREAM')
+        for single in (b'{"schemaVersion":2,"config":{},"layers":[]}',
+                       json.dumps({'schemaVersion': 2, 'manifests': [{'digest': child['digest']}]}).encode()):
+            with mock.patch.object(mirror, 'run', return_value=single), \
+                    mock.patch.dict(os.environ, {'MIRROR_PLATFORM': 'linux/amd64'}):
+                self.assertEqual(mirror.platform_digest('docker://low/x@' + pinned, pinned, 'UPSTREAM'), pinned)
+
     def test_concurrent_work_is_refused(self):
         with mirror.locked(self.root / 'work'):
             with self.assertRaisesRegex(mirror.MirrorError, 'another mirror process'):
@@ -201,8 +243,8 @@ class MirrorTest(unittest.TestCase):
         import shutil
 
         def fake_copy(_source, destination, *_args):
-            if destination.startswith('oci:'):
-                shutil.copytree(self.stage / 'oci', Path(destination.split(':')[1]), dirs_exist_ok=True)
+            if destination.startswith('dir:'):
+                shutil.copytree(self.stage / 'images' / image['digest'].replace(':', '-'), Path(destination[4:]))
 
         with mock.patch.object(mirror, 'copy', side_effect=fake_copy) as transport, \
                 mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
