@@ -23,6 +23,10 @@ import:
   needs:
     - job: verify
       artifacts: false
+  variables:
+    REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
   script:
-    - test -n "$IMPORT_WORK" && test -n "$MIRROR_INBOX"
-    - python3 mirror.py import --inbox "$MIRROR_INBOX"
+    - printf '%s' "$HIGH_QUAY_PASSWORD" | skopeo login --username "$HIGH_QUAY_USERNAME" --password-stdin "$HIGH_QUAY_HOST"
+    - python3 mirror.py import --inbox "${IMPORT_INBOX_DIR:?Set IMPORT_INBOX_DIR to the transfer inbox}"
+  after_script:
+    - rm -f "$CI_PROJECT_DIR/.registry-auth.json"

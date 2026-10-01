@@ -11,3 +11,4 @@ __pycache__/
 *.auth.json
 *.tar
 *.tar.sha256
+.registry-auth.json

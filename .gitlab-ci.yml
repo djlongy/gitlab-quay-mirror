@@ -19,8 +19,8 @@ verify:
     - python3 mirror.py targets
     - python3 -m unittest discover -s tests -v
 
-# A protected shell runner with persistent MIRROR_WORK and MIRROR_OUTBOX.
-# Merge-request validation runs elsewhere, without registry credentials or state mounts.
+# A protected shell runner. Its home directory keeps MIRROR_STATE_DIR between jobs.
+# Merge-request validation runs elsewhere, without registry credentials or state.
 sync:
   stage: publish
   environment:
@@ -31,14 +31,23 @@ sync:
   needs:
     - job: verify
       artifacts: false
+  variables:
+    # A CI job has no XDG_RUNTIME_DIR, so skopeo's default auth file is not writable.
+    REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
   script:
-    - test -n "$MIRROR_WORK" && test -n "$MIRROR_OUTBOX"
+    - printf '%s' "$LOW_QUAY_PASSWORD" | skopeo login --username "$LOW_QUAY_USERNAME" --password-stdin "$LOW_QUAY_HOST"
+    - |
+      if [ -n "${UPSTREAM_USERNAME:-}" ]; then
+        printf '%s' "$UPSTREAM_PASSWORD" | skopeo login --username "$UPSTREAM_USERNAME" --password-stdin "${UPSTREAM_REGISTRY:-docker.io}"
+      fi
     - |
       if [ "$MIRROR_FULL" = "true" ]; then
         python3 mirror.py sync --full
       else
         python3 mirror.py sync
       fi
+  after_script:
+    - rm -f "$CI_PROJECT_DIR/.registry-auth.json"
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never

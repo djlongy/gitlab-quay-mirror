@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise real registry transfers using the normal CLI (isolated test repositories only)."""
+"""Exercise real registry transfers using the normal CLI (isolated test repositories only).
+
+Log in to both registries with skopeo first. E2E_FIXTURES=true pushes two OCI indexes;
+otherwise E2E_SOURCE and E2E_UPDATE_SOURCE name upstream tags, e.g. Docker manifest lists.
+"""
 import json
 import gzip
 import hashlib
@@ -41,11 +45,11 @@ def transfer(bundle):
 
 
 def compare(image):
-    for side in ('LOW', 'HIGH'):
-        actual = mirror.raw_digest(f"docker://{os.environ[side + '_QUAY']}/{image['target']}:{image['tag']}", side)
+    for side in ('LOW_QUAY', 'HIGH_QUAY'):
+        actual = mirror.raw_digest(f"docker://{os.environ[side + '_HOST']}/{image['target']}:{image['tag']}", side)
         assert actual == image['digest'], (side, image['target'], actual)
-    raw = mirror.run('skopeo', 'inspect', '--raw', *mirror.options('HIGH'),
-                    f"docker://{os.environ['HIGH_QUAY']}/{image['target']}:{image['tag']}")
+    raw = mirror.run('skopeo', 'inspect', '--raw', *mirror.options('HIGH_QUAY'),
+                    f"docker://{os.environ['HIGH_QUAY_HOST']}/{image['target']}:{image['tag']}")
     platforms = [child.get('platform', {}) for child in json.loads(raw).get('manifests', [])]
     assert len(platforms) >= 2, 'test image must retain a multi-platform index'
     return {'image': image['target'] + ':' + image['tag'], 'digest': image['digest'], 'platforms': platforms}
@@ -81,29 +85,29 @@ def seed_fixtures(directory, target):
             children.append(child)
         index = put(json.dumps({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.index.v1+json',
                     'manifests': children}).encode(), 'application/vnd.oci.image.index.v1+json')
-        index['annotations'] = {mirror.OCI_REF: version}
+        index['annotations'] = {'org.opencontainers.image.ref.name': version}
         (layout / 'oci-layout').write_text('{"imageLayoutVersion":"1.0.0"}')
         (layout / 'index.json').write_text(json.dumps({'schemaVersion': 2, 'manifests': [index]}))
-        source = os.environ['LOW_QUAY'] + '/' + target + '-source:' + version
-        mirror.copy(f'oci:{layout}:{version}', 'docker://' + source, destination_side='LOW')
+        source = os.environ['LOW_QUAY_HOST'] + '/' + target + '-source:' + version
+        mirror.copy(f'oci:{layout}:{version}', 'docker://' + source, destination_side='LOW_QUAY')
         sources.append(source + '@' + index['digest'])
-    os.environ['UPSTREAM_AUTH_FILE'] = os.environ['LOW_AUTH_FILE']
-    os.environ['UPSTREAM_TLS_VERIFY'] = os.environ.get('LOW_TLS_VERIFY', 'true')
+    os.environ['UPSTREAM_TLS_VERIFY'] = os.environ.get('LOW_QUAY_TLS_VERIFY', 'true')
     return sources
 
 
 if __name__ == '__main__':
-    for key in ('LOW_QUAY', 'HIGH_QUAY', 'LOW_AUTH_FILE', 'HIGH_AUTH_FILE'):
+    for key in ('LOW_QUAY_HOST', 'HIGH_QUAY_HOST'):
         mirror.required_env(key)
     with tempfile.TemporaryDirectory(prefix='quay-mirror-e2e-') as temporary:
         directory = Path(temporary)
         catalog = directory / 'images.txt'
         outbox, inbox = directory / 'out', directory / 'in'
         inbox.mkdir()
-        os.environ.update(MIRROR_WORK=str(directory / 'work'), MIRROR_OUTBOX=str(outbox),
-                          IMPORT_WORK=str(directory / 'import'))
+        os.environ.update(MIRROR_STATE_DIR=str(directory / 'work'), MIRROR_BUNDLE_DIR=str(outbox),
+                          IMPORT_STATE_DIR=str(directory / 'import'))
         os.environ.pop('NIFI_URL', None)
-        target = os.environ.get('E2E_ORG', 'mirror') + '/proof-' + uuid.uuid4().hex[:12]
+        # Nested destination: organisation, then a repository path with its own slash.
+        target = os.environ.get('E2E_ORG', 'mirror') + '/proof-' + uuid.uuid4().hex[:12] + '/image'
         if os.environ.get('E2E_FIXTURES') == 'true':
             source, update_source = seed_fixtures(directory, target)
         else:
