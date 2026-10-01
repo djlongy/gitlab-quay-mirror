@@ -4,27 +4,27 @@
 Log in to both registries with skopeo first. E2E_FIXTURES=true pushes two OCI indexes;
 otherwise E2E_SOURCE and E2E_UPDATE_SOURCE name upstream tags, e.g. Docker manifest lists.
 """
-import json
 import gzip
 import hashlib
 import io
+import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 import uuid
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-import mirror  # noqa: E402
+import mirror
 
 
 def cli(*args, fail=None):
     result = subprocess.run([sys.executable, str(ROOT / 'mirror.py'), '--catalog', str(catalog), *args],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, check=False)
     print(result.stdout, end='', flush=True)
     if fail:
         assert result.returncode != 0 and fail in result.stderr, result.stdout + result.stderr
@@ -35,7 +35,7 @@ def cli(*args, fail=None):
 
 
 def last_bundle():
-    return sorted(outbox.glob('quay-*.tar'))[-1]
+    return max(outbox.glob('quay-*.tar'))
 
 
 def transfer(bundle):
@@ -62,7 +62,7 @@ def seed_fixtures(directory, target):
         layout = directory / version
         (layout / 'blobs/sha256').mkdir(parents=True)
 
-        def put(data, media_type):
+        def put(data, media_type, layout=layout):
             digest = hashlib.sha256(data).hexdigest()
             (layout / 'blobs/sha256' / digest).write_bytes(data)
             return {'mediaType': media_type, 'size': len(data), 'digest': 'sha256:' + digest}

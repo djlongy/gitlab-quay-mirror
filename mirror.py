@@ -2,12 +2,10 @@
 """Mirror reviewed container images into low Quay; export and import verified offline bundles."""
 
 import argparse
-from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -15,12 +13,19 @@ import sys
 import tarfile
 import tempfile
 import uuid
+from contextlib import contextmanager
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 TAG = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
 DIGEST = r"sha256:[0-9a-f]{64}"
 SOURCE = re.compile(rf"(?P<host>[a-z0-9.-]+(?::[0-9]+)?)/(?P<repo>[a-z0-9._/-]+):(?P<tag>{TAG})")
 TARGET = re.compile(r"[a-z0-9][a-z0-9_-]*(?:/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)+")
+IMAGE_CONFIGS = ("application/vnd.oci.image.config.v1+json", "application/vnd.docker.container.image.v1+json")
+IMAGE_LAYER = re.compile(r"application/vnd\.oci\.image\.layer\.(?:nondistributable\.)?v1\.tar(?:\+gzip|\+zstd)?"
+                         r"|application/vnd\.docker\.image\.rootfs\.(?:foreign\.)?diff\.tar(?:\.gzip)?")
+MANIFESTS = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json")
+INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
 
 
 class MirrorError(Exception):
@@ -106,8 +111,14 @@ def catalog(path):
     return images
 
 
+def say(message):
+    if os.environ.get("MIRROR_VERBOSE") == "true":
+        print(message, file=sys.stderr, flush=True)
+
+
 def run(*args):
-    result = subprocess.run(args, capture_output=True)
+    say("+ " + " ".join(args))
+    result = subprocess.run(args, capture_output=True, check=False)
     if result.returncode:
         raise MirrorError(f"{args[0]} {args[1]} failed: {result.stderr.decode(errors='replace')[-500:].strip()}")
     return result.stdout
@@ -123,6 +134,14 @@ def raw_digest(reference, side):
     # A manifest digest is the sha256 of its exact bytes, which --raw returns.
     raw = run("skopeo", "inspect", "--raw", *options(side), reference)
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def fetch_manifest(reference, side="UPSTREAM"):
+    """The manifest bytes at reference@digest, checked against that digest."""
+    raw = run("skopeo", "inspect", "--raw", *options(side), reference)
+    if "sha256:" + hashlib.sha256(raw).hexdigest() != reference.rsplit("@", 1)[1]:
+        raise MirrorError(f"manifest digest mismatch: {reference}")
+    return raw
 
 
 def transport_reference(source):
@@ -150,15 +169,56 @@ def normalise(source):
     return source
 
 
+def runnable(manifest, fetch=None, depth=0):
+    """True for an image or an image index; false for signatures and other OCI artifacts.
+
+    A cosign signature uses the OCI image config media type, so an image is also
+    recognised by its layers. With fetch, each index child is fetched and checked
+    itself; without it, a child is judged by its descriptor.
+    """
+    if manifest.get("artifactType"):
+        return False
+    if "manifests" in manifest:
+        return any(image_child(child, fetch, depth) for child in manifest["manifests"])
+    layers = manifest.get("layers")
+    return (manifest.get("config", {}).get("mediaType") in IMAGE_CONFIGS and isinstance(layers, list)
+            and all(IMAGE_LAYER.fullmatch(str(layer.get("mediaType"))) for layer in layers))
+
+
+def referrer(child):
+    """A signature or a BuildKit attestation listed beside the images of an index."""
+    return bool(child.get("artifactType") or (child.get("platform") or {}).get("os") == "unknown"
+                or "vnd.docker.reference.type" in (child.get("annotations") or {}))
+
+
+def image_child(child, fetch, depth):
+    if referrer(child):
+        return False
+    kind = child.get("mediaType")
+    if kind not in (*MANIFESTS, *INDEXES, None):
+        return False
+    if fetch and depth < 3 and re.fullmatch(DIGEST, str(child.get("digest"))):
+        # A cosign signature shares the image manifest media type, so only the child itself can tell.
+        return runnable(json.loads(fetch(child["digest"])), fetch, depth + 1)
+    return kind in MANIFESTS or (kind is None and bool(child.get("platform")))
+
+
 def add_image(path, source, target):
     source = normalise(source)
     name = source.split("@", 1)[0]
     if not SOURCE.fullmatch(name) or not TARGET.fullmatch(target):
         raise MirrorError("add needs [registry/]repo:tag and org/repo[/path]")
-    digest = raw_digest("docker://" + transport_reference(source), "UPSTREAM")
+    raw = run("skopeo", "inspect", "--raw", *options("UPSTREAM"), "docker://" + transport_reference(source))
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if not runnable(json.loads(raw), lambda child: fetch_manifest(f"docker://{name.rsplit(':', 1)[0]}@{child}")):
+        raise MirrorError(f"{name} is a signature, attestation or metadata artifact, not a container image; "
+                          "add the tag you run, for example :latest, instead")
     image = parse_image(name + "@" + digest, target)
     if "@" in source and source.split("@", 1)[1] != digest:
         raise MirrorError("source digest does not match the manifest")
+    repository = "docker://" + name.rsplit(":", 1)[0]
+    tags = publish_tags(image["tag"], platform_digest(f"{repository}@{digest}", digest, "UPSTREAM"),
+                        repository, "UPSTREAM")
     images = catalog(path) if path.exists() else []
     if any((i['target'], i['tag']) == (target, image['tag']) for i in images):
         raise MirrorError("target tag already exists; edit its reviewed catalog entry")
@@ -166,7 +226,7 @@ def add_image(path, source, target):
         if path.stat().st_size:
             stream.write("\n")
         stream.write(f"{image['source']} {target}\n")
-    print(f"added: {image['source']} -> {target}:{image['tag']}")
+    print(f"added: {image['source']} -> {target}:{', :'.join(tags)}")
 
 
 def verify_image(directory, digest):
@@ -201,12 +261,31 @@ def platform_digest(reference, digest, side):
     if not wanted:
         return digest
     data = json.loads(run("skopeo", "inspect", "--raw", *options(side), reference))
-    if "manifests" not in data or not any("platform" in child for child in data["manifests"]):
-        return digest  # a single image, or an artifact index such as signatures, goes whole
     keys = ("os", "architecture", "variant")
     want = dict(zip(keys, wanted.split("/")))
+    if "manifests" not in data:
+        # A single image goes whole, but only when its config names the wanted platform.
+        config = json.loads(run("skopeo", "inspect", "--config", "--raw", *options(side), reference))
+        found = {k: config.get(k) for k in want} if isinstance(config, dict) else {}
+        if found != want:
+            raise MirrorError(f"{reference}: is a {'/'.join(str(v) for v in found.values())} image, not {wanted}")
+        return digest
+    repository = reference.rsplit("@", 1)[0]
+
+    def platform(child):
+        # Checked before the platform field: a referrer or nested index may name a platform too.
+        if (child.get("mediaType") not in (*MANIFESTS, None) or referrer(child)
+                or not re.fullmatch(DIGEST, str(child.get("digest")))):
+            return {}  # a nested index or a referrer: not an image this index can select
+        if "platform" in child:
+            return child["platform"] or {}
+        # The platform is optional in an index; the child image's config names it instead.
+        config = json.loads(run("skopeo", "inspect", "--config", "--raw", *options(side),
+                                f"{repository}@{child['digest']}"))
+        return config if isinstance(config, dict) else {}
+
     matches = [child["digest"] for child in data["manifests"]
-               if {k: child.get("platform", {}).get(k) for k in want} == want]
+               if {k: platform(child).get(k) for k in want} == want]
     if len(matches) != 1 or not re.fullmatch(DIGEST, matches[0]):
         raise MirrorError(f"{reference}: expected one {wanted} image, found {len(matches)}")
     return matches[0]
@@ -220,8 +299,49 @@ def verify_platform(directory, image):
     if not path.is_file() or sha256(path) != image["digest"][7:]:
         raise MirrorError(f"missing or corrupt approved index: {image['digest']}")
     children = json.loads(path.read_bytes()).get("manifests", [])
-    if image["transfer"] not in [child.get("digest") for child in children]:
+    listed = [child for child in children if child.get("digest") == image["transfer"]]
+    if not listed:
         raise MirrorError(f"{image['transfer']} is not part of approved {image['digest']}")
+    if any(referrer(child) or child.get("mediaType") not in (*MANIFESTS, None) for child in listed):
+        raise MirrorError(f"{image['transfer']} in approved {image['digest']} is not an image")
+
+
+def publish_tags(tag, transfer, repository, side):
+    """The tags an image gets on both Quays: the upstream tag, unchanged.
+
+    latest names no release, and once it moves Quay garbage-collects the untagged
+    old image. A latest image is therefore also tagged with the version it reports.
+    """
+    if tag != "latest":
+        return [tag]
+    version = app_version(f"{repository}@{transfer}", side)
+    return ["latest", *([version] if version not in ("", "latest") else [])]
+
+
+def app_version(reference, side):
+    """The version an image reports about itself, for images published as latest.
+
+    Bitnami's Docker Hub images ship only latest; every other tag is a signature or
+    metadata artifact. Same order of preference as quay-diode-poc's pack-inventory.
+    An image that reports no version gives "". A failed lookup raises, so a run
+    never reports success while the version tag is missing.
+    """
+    wanted = os.environ.get("MIRROR_PLATFORM", "").strip()
+    os_name, _, arch = wanted.partition("/")
+    override = [f"--override-os={os_name}", f"--override-arch={arch.split('/')[0]}"] if wanted else []
+    try:
+        if not wanted:
+            # Inspect one image of an index, not whichever platform this host happens to run.
+            children = json.loads(run("skopeo", "inspect", "--raw", *options(side), reference)).get("manifests")
+            images = [child["digest"] for child in children or [] if image_child(child, None, 0)]
+            reference = reference.rsplit("@", 1)[0] + "@" + images[0] if images else reference
+        data = json.loads(run("skopeo", *override, "inspect", *options(side), reference))
+    except MirrorError as error:
+        raise MirrorError(f"cannot read the version of {reference}: {error}") from error
+    labels = data.get("Labels") or {}
+    found = [labels.get("org.opencontainers.image.version"), labels.get("app.kubernetes.io/version")]
+    found += [env.split("=", 1)[1] for env in data.get("Env") or [] if env.startswith("APP_VERSION=")]
+    return next((v for v in found if v and re.fullmatch(TAG, v)), "")
 
 
 def notify(bundle):
@@ -249,27 +369,63 @@ def sync(path, full=False):
             raise MirrorError(f"{work} belongs to another low registry; set a separate MIRROR_STATE_DIR")
         full = full or not state["sequence"] or state.get("pending", False)
         changed, known, platforms = [], state.get("platforms", {}), {}
+        platform = os.environ.get("MIRROR_PLATFORM", "").strip()
+        # A tag a catalog entry pins, or pinned before its line was removed, is never a version tag.
+        pinned = state.setdefault("pinned", sorted(state["sent"]))
+        catalog_tags = {f"{i['target']}:{i['tag']}" for i in images} | set(pinned)
         for image in images:
+            key = f"{image['target']}:{image['tag']}"
+            # The ledger records the platform too, so changing MIRROR_PLATFORM resends the image.
+            sent = f"{image['digest']} {platform}".strip()
             # Pin the source by digest; upstream tag movement cannot change approved bytes.
             source = transport_reference(image["source"])
-            destination = f"docker://{low}/{image['target']}:{image['tag']}"
-            # Remember each platform choice so an unchanged image needs no upstream request.
-            lookup = f"{image['digest']} {os.environ.get('MIRROR_PLATFORM', '').strip()}"
-            transfer = known.get(lookup) or platform_digest("docker://" + source, image["digest"], "UPSTREAM")
-            platforms[lookup] = transfer
-            observed = None
-            if state["sent"].get(f"{image['target']}:{image['tag']}") == image["digest"]:
-                try:
-                    observed = raw_digest(destination, "LOW_QUAY")
-                except MirrorError as error:
-                    if not any(reason in str(error).lower() for reason in ('manifest unknown', 'name unknown')):
-                        raise
-            if observed != transfer:
-                copy("docker://" + source.split("@")[0] + "@" + transfer, destination, "UPSTREAM", "LOW_QUAY")
-            if raw_digest(destination, "LOW_QUAY") != transfer:
-                raise MirrorError(f"low mirror digest mismatch: {image['target']}")
-            if full or state["sent"].get(f"{image['target']}:{image['tag']}") != image["digest"]:
-                changed.append(image | {"transfer": transfer})
+            # Remember each platform and tag choice so an unchanged image needs no upstream request.
+            lookup = f"{image['digest']} {platform} {image['tag']}"
+            # A full sync is a recovery, so it asks upstream again.
+            cached = None if full else known.get(lookup)
+            if isinstance(cached, list) and len(cached) == 2 and isinstance(cached[1], list):
+                transfer, tags = cached
+            else:
+                transfer = platform_digest("docker://" + source, image["digest"], "UPSTREAM")
+                tags = publish_tags(image["tag"], transfer, "docker://" + source.split("@")[0], "UPSTREAM")
+            if tags != ["latest"]:  # a latest image with no version yet is asked again next run
+                platforms[lookup] = [transfer, tags]
+            for tag in tags[1:]:
+                if f"{image['target']}:{tag}" in catalog_tags:
+                    print(f"warning: {key} reports version {tag}, which images.txt pins or once pinned; not tagging it",
+                          file=sys.stderr)
+            tags = [tags[0], *[t for t in tags[1:] if f"{image['target']}:{t}" not in catalog_tags]]
+            # sent.json records the digest per catalog tag and, under aliases, the version tags sent with it.
+            aliases = state.get("aliases", {}).get(key, [])
+            if key not in pinned:
+                # Recorded before the first copy, so a run that fails after it still protects the tag.
+                pinned.append(key)
+                write_json(state_file, state)
+            known_tags = [image["tag"], *aliases] if state["sent"].get(key) == sent else []
+            for number, tag in enumerate(tags):
+                destination = f"docker://{low}/{image['target']}:{tag}"
+                observed = None
+                if tag in known_tags:
+                    try:
+                        observed = raw_digest(destination, "LOW_QUAY")
+                    except MirrorError as error:
+                        # Missing, deleted or expired: copy it again; a real fault fails the copy below.
+                        say(f"low copy unreadable, recopying: {error}")
+                if observed == transfer:
+                    continue
+                if number:  # a version tag points at the image already in low Quay
+                    copy(f"docker://{low}/{image['target']}@{transfer}", destination, "LOW_QUAY", "LOW_QUAY")
+                else:
+                    copy("docker://" + source.split("@")[0] + "@" + transfer, destination, "UPSTREAM", "LOW_QUAY")
+                if raw_digest(destination, "LOW_QUAY") != transfer:
+                    raise MirrorError(f"low mirror digest mismatch: {image['target']}:{tag}")
+            names = f"{image['target']}:{', :'.join(tags)}"
+            due = full or state["sent"].get(key) != sent or aliases != tags[1:]
+            if due:
+                changed.append(image | {"transfer": transfer, "tags": tags})
+                print(f"send: {names} {transfer}")
+            else:
+                say(f"unchanged: {names} {transfer}")
         state["platforms"] = platforms
         if not changed:
             write_json(state_file, state)
@@ -289,7 +445,7 @@ def sync(path, full=False):
                     copy(f"docker://{low}/{image['target']}@{image['transfer']}", f"dir:{directory}", "LOW_QUAY")
                     verify_image(directory, image["transfer"])
                 if image["transfer"] != image["digest"]:
-                    # Carry the approved index so import can prove the platform image belongs to it.
+                    # Carry the approved index so import can check the platform image is listed in it.
                     index = run("skopeo", "inspect", "--raw", *options("UPSTREAM"),
                                 "docker://" + transport_reference(image["source"]))
                     (directory / f"{image['digest'][7:]}.manifest.json").write_bytes(index)
@@ -308,7 +464,13 @@ def sync(path, full=False):
             temporary_sidecar.write_text(f"{sha256(bundle)}  {bundle.name}\n")
             os.replace(temporary_sidecar, sidecar)  # readiness marker, published last
         notify(bundle)
-        state["sent"].update({f"{i['target']}:{i['tag']}": i["digest"] for i in changed})
+        state["sent"].update({f"{i['target']}:{i['tag']}": f"{i['digest']} {platform}".strip() for i in changed})
+        aliases = state.setdefault("aliases", {})
+        for i in changed:
+            if i["tags"][1:]:
+                aliases[f"{i['target']}:{i['tag']}"] = i["tags"][1:]
+            else:
+                aliases.pop(f"{i['target']}:{i['tag']}", None)
         state["pending"] = False
         write_json(state_file, state)
         print(f"bundle: {bundle} ({len(changed)} image(s), {bundle.stat().st_size} bytes)")
@@ -316,7 +478,7 @@ def sync(path, full=False):
 
 
 def extract(bundle, directory):
-    allowed = re.compile(r"images\.json|images/sha256-[0-9a-f]{64}/(?:version|manifest\.json|[0-9a-f]{64}(?:\.manifest\.json)?)")
+    allowed = re.compile(r"images\.json|images/sha256-[0-9a-f]{64}/(?:version|manifest\.json|signature-[0-9]+|[0-9a-f]{64}(?:\.manifest\.json)?)")
     with tarfile.open(bundle) as archive:
         seen = set()
         members = archive.getmembers()
@@ -344,10 +506,16 @@ def validate_manifest(manifest):
     seen = set()
     for image in manifest["images"]:
         fields = ('source', 'target', 'tag', 'digest', 'transfer')
-        if (not isinstance(image, dict) or set(image) != set(fields)
-                or not all(isinstance(image[k], str) for k in fields) or not re.fullmatch(DIGEST, image["transfer"])):
+        if isinstance(image, dict) and "tags" not in image:
+            image["tags"] = [image.get("tag")]  # a sender from before version tags: the catalog tag alone
+        tags = image.get("tags") if isinstance(image, dict) else None
+        if (not isinstance(image, dict) or set(image) != {*fields, "tags"}
+                or not all(isinstance(image[k], str) for k in fields) or not re.fullmatch(DIGEST, image["transfer"])
+                or not isinstance(tags, list) or not all(isinstance(t, str) and re.fullmatch(TAG, t) for t in tags)
+                or tags[:1] != [image["tag"]] or len(set(tags)) != len(tags)
+                or len(tags) > (2 if image["tag"] == "latest" else 1)):
             raise MirrorError("invalid image entry")
-        if parse_image(image["source"], image["target"]) | {"transfer": image["transfer"]} != image:
+        if parse_image(image["source"], image["target"]) | {k: image[k] for k in ("transfer", "tags")} != image:
             raise MirrorError("image metadata does not match pinned source")
         key = f"{image['target']}:{image['tag']}"
         if key in seen:
@@ -391,11 +559,13 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
         if manifest["sequence"] != previous + 1 and not manifest["full"]:
             raise SequenceGap("missing earlier bundle; recover with sync --full")
         for image in manifest["images"]:
-            destination = f"docker://{high}/{image['target']}:{image['tag']}"
-            copy(f"dir:{stage / 'images' / image['transfer'].replace(':', '-')}", destination,
-                 destination_side="HIGH_QUAY")
-            if raw_digest(destination, "HIGH_QUAY") != image["transfer"]:
-                raise MirrorError(f"high mirror digest mismatch: {image['target']}")
+            for tag in image["tags"]:
+                destination = f"docker://{high}/{image['target']}:{tag}"
+                copy(f"dir:{stage / 'images' / image['transfer'].replace(':', '-')}", destination,
+                     destination_side="HIGH_QUAY")
+                if raw_digest(destination, "HIGH_QUAY") != image["transfer"]:
+                    raise MirrorError(f"high mirror digest mismatch: {image['target']}:{tag}")
+                print(f"pushed: {image['target']}:{tag} {image['transfer']}")
         write_json(receipt_file, {"stream": manifest["stream"], "sequence": manifest["sequence"],
                                 "digest": digest, "registry": high})
     print(f"imported: {bundle.name} ({len(manifest['images'])} image(s), digests verified)")
@@ -426,6 +596,8 @@ def import_inbox(inbox, adopt_stream=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", type=Path, default=ROOT / "images.txt")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="print every skopeo and curl command and each image decision (or MIRROR_VERBOSE=true)")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("targets", help="validate and list the image catalog")
     add = commands.add_parser("add", help="resolve a tag to its digest and append a reviewed catalog entry")
@@ -439,6 +611,8 @@ def main(argv=None):
     selection.add_argument("--inbox", type=Path)
     high.add_argument("--adopt-stream", action="store_true", help="accept a full bundle from a replacement sender")
     args = parser.parse_args(argv)
+    if args.verbose:
+        os.environ["MIRROR_VERBOSE"] = "true"
     try:
         if args.command == "targets":
             for image in catalog(args.catalog):
