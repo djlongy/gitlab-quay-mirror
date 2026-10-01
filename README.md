@@ -35,23 +35,26 @@ Mirrors reviewed images into low Quay and exports offline bundles for high Quay.
 | `HIGH_QUAY_USERNAME`, `HIGH_QUAY_PASSWORD` | Import | Robot with push/pull on the high target organisations |
 | `UPSTREAM_USERNAME`, `UPSTREAM_PASSWORD`, `UPSTREAM_REGISTRY` | Rate-limited upstream | Pull credentials; registry defaults to `docker.io` |
 
-Keep credentials out of `images.txt`, Git and transfer bundles.
-
 ## Minimum configuration
 
-Add each image with its tag and destination. `add` looks up the tag's current digest and appends the pinned line to `images.txt`:
+Add each image by the tag you run. `add` looks up its current digest and appends a pinned line to `images.txt`. Destinations take any depth, and short names expand like `docker pull`.
 
 ```sh
 python3 mirror.py add prom/prometheus:v3.13.4 team-dev/prom/prometheus
+python3 mirror.py add bitnami/redis:latest team-dev/bitnami/redis
 ```
 
 ```text
-docker.io/prom/prometheus:v3.13.4@sha256:87861b8cf91579109319ebc300f3f1060e6da9c05d6ae8ad15a20c879e84e32e team-dev/prom/prometheus
+docker.io/prom/prometheus:v3.13.4@sha256:87861b8c... team-dev/prom/prometheus
+docker.io/bitnami/redis:latest@sha256:f4797b37... team-dev/bitnami/redis
 ```
 
-Both Quays use the destination `team-dev/prom/prometheus:v3.13.4`. The destination is an organisation and a repository path of any depth. Short names expand like `docker pull`: `alpine:3.20` is `docker.io/library/alpine:3.20`.
+| Image | Tags on low and high Quay | After Renovate's update merges |
+|---|---|---|
+| `prom/prometheus` (released tags) | `v3.13.4`, as on Docker Hub | `v3.15.0` added; `v3.13.4` stays |
+| `bitnami/redis` (publishes only `latest`) | `latest` and `8.10.2`, the version the image reports | `latest` moves to the new digest and its version tag is added; `8.10.2` stays |
 
-For an image published only as `latest`, such as `bitnami/redis`, pin `latest`: `add bitnami/redis:latest mirror/bitnami/redis`. Renovate then proposes the new digest whenever `latest` moves. Its `sha256-<hex>` tags are signature indexes, not versions.
+The version comes from `org.opencontainers.image.version`, `app.kubernetes.io/version` or `APP_VERSION`. An image that reports none gets `latest` alone and is asked again on each sync; a failed lookup fails the run. `add` refuses signature and metadata artifacts such as bitnami's `sha256-<hex>` tags, which are not images.
 
 ## Usage
 
@@ -71,9 +74,10 @@ python3 mirror.py sync
 ## Behaviour
 
 Default-branch catalog/script/pipeline changes, schedules and Run pipeline run sync after verification.
-Every sync verifies tagged low-side copies and copies new or changed approved digests; unchanged entries need no upstream pull.
-Only changed target/tag/digest entries enter the archive. Each archive holds every platform of those images, or only `MIRROR_PLATFORM`'s.
-With `MIRROR_PLATFORM` set, low Quay, the archive and high Quay hold that platform's image, whose digest differs from the index digest in `images.txt`. Run `sync --full` after changing it.
+Every sync verifies each tagged low-side copy, version tags included, restores any that is missing and copies new or changed approved digests; unchanged entries need no upstream pull.
+`sent.json` in `MIRROR_STATE_DIR` records the digest and version tags last sent for each destination tag, and only entries where either changed enter a bundle. A daily run with no change prints `nothing to send` and writes no bundle. Sync never reads or deletes the bundle directory; the pickup removes bundles.
+`-v` (or `MIRROR_VERBOSE=true`) prints every skopeo and curl command and each unchanged entry; normal output prints one `send:` line per bundled image.
+With `MIRROR_PLATFORM` set, low Quay, the archive and high Quay hold only that platform's image: its digest is the one the index lists for that platform, not the index digest in `images.txt`. Where the index names no platforms, each child image's config decides. A signature, attestation or nested index is never selected, whatever platform it names. An image or index with no image for that platform fails sync before any copy. Changing it resends every image.
 Quay refuses Windows image manifests, so an all-platform mirror of an image with Windows children (such as `registry.k8s.io/pause`) fails. Set `MIRROR_PLATFORM` for it.
 
 Carry the `.tar` and matching `.sha256` together. Import checks the archive and every manifest, config and layer against its digest before pushing.
@@ -81,8 +85,7 @@ Carry the `.tar` and matching `.sha256` together. Import checks the archive and 
 Missing checksums wait; missing sequence numbers, conflicting replays and corrupt content fail.
 A missed transfer is recovered with `python3 mirror.py sync --full`; deleting sender state requires a reviewed full bundle and `import --adopt-stream`.
 
-For Helm workloads, render the chart with your actual values and add the resulting image references to the catalog.
-A chart version or `appVersion` is not a complete list of its images, init containers or hooks.
+For Helm workloads, render the chart with your actual values and add the resulting images; a chart version or `appVersion` does not list them all.
 
 ## Out of scope
 
@@ -92,6 +95,5 @@ A chart version or `appVersion` is not a complete list of its images, init conta
 
 ## Expected result
 
-Sync prints a bundle path, or `nothing to send; low-side digests verified`.
-High-side import prints `digests verified` after reading the destination manifests back.
+Sync prints one `send:` line per image and the bundle path, or `nothing to send; low-side digests verified`. Import prints one `pushed:` line per tag and `digests verified`.
 Verify the catalog at either end with `python3 mirror.py targets`.
