@@ -8,12 +8,17 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -25,6 +30,10 @@ IMAGE_CONFIGS = ("application/vnd.oci.image.config.v1+json", "application/vnd.do
 IMAGE_LAYER = re.compile(r"application/vnd\.oci\.image\.layer\.(?:nondistributable\.)?v1\.tar(?:\+gzip|\+zstd)?"
                          r"|application/vnd\.docker\.image\.rootfs\.(?:foreign\.)?diff\.tar(?:\.gzip)?")
 MANIFESTS = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json")
+CHART_CONFIG = "application/vnd.cncf.helm.config.v1+json"
+CHART_LAYERS = ("application/vnd.cncf.helm.chart.content.v1.tar+gzip", "application/vnd.cncf.helm.chart.provenance.v1.prov")
+LEDGER, BUNDLES = "quay-mirror-ledger", "quay-bundles"
+BUNDLE_NAME = re.compile(r"(quay-[0-9a-f]{32}-[0-9]{12})\.tar(?:\.sha256)?")
 INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
 
 
@@ -158,6 +167,87 @@ def copy(source, destination, source_side=None, destination_side=None):
     run(*args, source, destination)
 
 
+def ledger_enabled():
+    return os.environ.get("MIRROR_LEDGER") == "true"
+
+
+def packages():
+    """The project's generic package API and the header that authenticates to it.
+
+    PACKAGE_TOKEN (a personal, project or group access token) wins; in CI the job
+    token reads and writes the job's own project, which is all sync and import need.
+    """
+    api = (os.environ.get("GITLAB_API_URL") or os.environ.get("CI_API_V4_URL") or "").rstrip("/")
+    project = os.environ.get("PACKAGE_PROJECT") or os.environ.get("CI_PROJECT_ID") or ""
+    token = os.environ.get("PACKAGE_TOKEN")
+    header = ("PRIVATE-TOKEN", token) if token else ("JOB-TOKEN", os.environ.get("CI_JOB_TOKEN", ""))
+    if not api or not project or not header[1]:
+        raise MirrorError("the package registry needs GITLAB_API_URL, PACKAGE_PROJECT and PACKAGE_TOKEN "
+                          "(a CI job supplies all three)")
+    return f"{api}/projects/{urllib.parse.quote(project, safe='')}/packages/generic", header
+
+
+def package_request(method, package, version, name, data=None):
+    base, (key, value) = packages()
+    url = f"{base}/{package}/{version}/{urllib.parse.quote(name)}"
+    say(f"+ {method} {url}")
+    context = ssl.create_default_context(cafile=os.environ.get("CA_BUNDLE") or None)
+    request = urllib.request.Request(url, data=data, method=method, headers={key: value})
+    return urllib.request.urlopen(request, timeout=600, context=context)
+
+
+def package_get(package, version, name, destination=None):
+    """A generic package file's bytes, or written to destination; None when GitLab has none."""
+    try:
+        with package_request("GET", package, version, name) as response:
+            if destination is None:
+                return response.read()
+            with open(destination, "wb") as stream:
+                shutil.copyfileobj(response, stream)
+            return destination
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise MirrorError(f"GET {package}/{version}/{name}: HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise MirrorError(f"GET {package}/{version}/{name}: {error.reason}") from error
+
+
+def package_put(package, version, name, data):
+    try:
+        package_request("PUT", package, version, name, data).close()
+    except urllib.error.HTTPError as error:
+        raise MirrorError(f"PUT {package}/{version}/{name}: HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise MirrorError(f"PUT {package}/{version}/{name}: {error.reason}") from error
+
+
+def load_state(state_file):
+    """Sender state: the ledger's head when MIRROR_LEDGER=true, else the runner's sent.json."""
+    if ledger_enabled():
+        raw = package_get(LEDGER, "head", "state.json")
+        return json.loads(raw) if raw else None
+    return json.loads(state_file.read_text()) if state_file.exists() else None
+
+
+def save_state(state_file, state, remote=True):
+    """Write sent.json and, with remote, the ledger's head. GitLab serves the newest upload of a name."""
+    write_json(state_file, state)
+    if remote and ledger_enabled():
+        package_put(LEDGER, "head", "state.json", state_file.read_bytes())
+
+
+def ledger_records(last):
+    """Every recorded bundle, oldest first: one GET per sequence. Past a few thousand bundles,
+    list the packages API instead."""
+    records = []
+    for sequence in range(1, last + 1):
+        raw = package_get(LEDGER, f"{sequence:012d}", "images.json")
+        if raw:  # an interrupted run reserves a sequence and records nothing
+            records.append(json.loads(raw))
+    return records
+
+
 def normalise(source):
     """Expand a short name the way docker pull does: alpine:3 is docker.io/library/alpine:3."""
     first, _, rest = source.partition("/")
@@ -178,11 +268,21 @@ def runnable(manifest, fetch=None, depth=0):
     """
     if manifest.get("artifactType"):
         return False
+    if chart(manifest):
+        return True
     if "manifests" in manifest:
         return any(image_child(child, fetch, depth) for child in manifest["manifests"])
     layers = manifest.get("layers")
     return (manifest.get("config", {}).get("mediaType") in IMAGE_CONFIGS and isinstance(layers, list)
             and all(IMAGE_LAYER.fullmatch(str(layer.get("mediaType"))) for layer in layers))
+
+
+def chart(manifest):
+    """A Helm chart pushed to an OCI registry: one chart config, a chart tarball and maybe its provenance."""
+    layers = manifest.get("layers")
+    kinds = [layer.get("mediaType") for layer in layers] if isinstance(layers, list) else []
+    return (manifest.get("config", {}).get("mediaType") == CHART_CONFIG and CHART_LAYERS[0] in kinds
+            and all(kind in CHART_LAYERS for kind in kinds))
 
 
 def referrer(child):
@@ -223,7 +323,7 @@ def add_image(path, source, target):
     if any((i['target'], i['tag']) == (target, image['tag']) for i in images):
         raise MirrorError("target tag already exists; edit its reviewed catalog entry")
     with path.open("a") as stream:
-        if path.stat().st_size:
+        if path.stat().st_size and not path.read_text().endswith("\n"):
             stream.write("\n")
         stream.write(f"{image['source']} {target}\n")
     print(f"added: {image['source']} -> {target}:{', :'.join(tags)}")
@@ -263,6 +363,8 @@ def platform_digest(reference, digest, side):
     data = json.loads(run("skopeo", "inspect", "--raw", *options(side), reference))
     keys = ("os", "architecture", "variant")
     want = dict(zip(keys, wanted.split("/")))
+    if chart(data):
+        return digest  # a chart has no platform
     if "manifests" not in data:
         # A single image goes whole, but only when its config names the wanted platform.
         config = json.loads(run("skopeo", "inspect", "--config", "--raw", *options(side), reference))
@@ -344,14 +446,17 @@ def app_version(reference, side):
     return next((v for v in found if v and re.fullmatch(TAG, v)), "")
 
 
-def notify(bundle):
+def notify(bundle, kind):
+    """POST the checksum, then the bundle, to NIFI_URL. The X- headers route it in NiFi, as the pypi mirror's do."""
     url = os.environ.get("NIFI_URL")
     if url:
-        for path in (bundle.with_name(bundle.name + ".sha256"), bundle):
+        for path, form in ((bundle.with_name(bundle.name + ".sha256"), "sha256"), (bundle, "tar")):
             run("curl", "--fail", "--show-error", "--silent", "--connect-timeout", "15",
                 "--max-time", "3600", "--retry", "2", "--request", "POST",
                 "--header", f"Filename: {path.name}", "--header", "Content-Type: application/octet-stream",
-                "--data-binary", f"@{path}", url)
+                "--header", f"X-Sha256: {sha256(path)}", "--header", "X-Artifact-Type: container-images",
+                "--header", f"X-Artifact-Format: {form}", "--header", "X-Artifact-Action: mirror",
+                "--header", f"X-Bundle-Kind: {kind}", "--data-binary", f"@{path}", url)
 
 
 def sync(path, full=False):
@@ -360,11 +465,11 @@ def sync(path, full=False):
     if not images:
         raise MirrorError("catalog is empty; add an image before syncing")
     work = state_path("MIRROR_STATE_DIR", "quay-mirror")
-    outbox = Path(os.environ.get("MIRROR_BUNDLE_DIR") or work / "bundles")
     with locked(work):
         state_file = work / "sent.json"
-        state = json.loads(state_file.read_text()) if state_file.exists() else {
+        state = load_state(state_file) or {
             "stream": uuid.uuid4().hex, "sequence": 0, "sent": {}, "registry": low}
+        loaded = json.dumps(state, sort_keys=True)
         if state.get("registry") != low:
             raise MirrorError(f"{work} belongs to another low registry; set a separate MIRROR_STATE_DIR")
         full = full or not state["sequence"] or state.get("pending", False)
@@ -400,7 +505,7 @@ def sync(path, full=False):
             if key not in pinned:
                 # Recorded before the first copy, so a run that fails after it still protects the tag.
                 pinned.append(key)
-                write_json(state_file, state)
+                save_state(state_file, state, remote=False)
             known_tags = [image["tag"], *aliases] if state["sent"].get(key) == sent else []
             for number, tag in enumerate(tags):
                 destination = f"docker://{low}/{image['target']}:{tag}"
@@ -428,42 +533,68 @@ def sync(path, full=False):
                 say(f"unchanged: {names} {transfer}")
         state["platforms"] = platforms
         if not changed:
-            write_json(state_file, state)
+            # A quiet day rewrites the ledger head only when the cached tag choices changed.
+            save_state(state_file, state, remote=json.dumps(state, sort_keys=True) != loaded)
             print("nothing to send; low-side digests verified")
             return None
-        outbox.mkdir(parents=True, exist_ok=True)
-        # Reserve a sequence before publishing. An interrupted export forces the next one full.
-        state.update(sequence=state["sequence"] + 1, pending=True)
-        write_json(state_file, state)
-        with tempfile.TemporaryDirectory(dir=work) as temporary:
-            stage = Path(temporary)
-            (stage / "images").mkdir()
-            for image in changed:
-                directory = stage / "images" / image["transfer"].replace(":", "-")
-                if not directory.exists():
-                    # dir: keeps a Docker manifest list byte for byte; oci: would have to convert it.
+        return send(work, state_file, state, low, changed, full, "full" if full else "delta")
+
+
+def send(work, state_file, state, low, changed, full, kind, bridges=None):
+    """Write the next bundle, record it in the ledger and hand it to NiFi.
+
+    bridges: the first sequence a resend stands in for, so the high side accepts it over a gap.
+    """
+    platform = os.environ.get("MIRROR_PLATFORM", "").strip()
+    outbox = Path(os.environ.get("MIRROR_BUNDLE_DIR") or work / "bundles")
+    outbox.mkdir(parents=True, exist_ok=True)
+    # Reserve a sequence before publishing. An interrupted export forces the next one full.
+    state.update(sequence=state["sequence"] + 1, pending=True)
+    save_state(state_file, state)
+    metadata = {"schema": 1, "stream": state["stream"], "sequence": state["sequence"], "full": full,
+                "images": changed, **({"from": bridges} if bridges else {})}
+    with tempfile.TemporaryDirectory(dir=work) as temporary:
+        stage = Path(temporary)
+        (stage / "images").mkdir()
+        for image in changed:
+            directory = stage / "images" / image["transfer"].replace(":", "-")
+            if not directory.exists():
+                # dir: keeps a Docker manifest list byte for byte; oci: would have to convert it.
+                try:
                     copy(f"docker://{low}/{image['target']}@{image['transfer']}", f"dir:{directory}", "LOW_QUAY")
-                    verify_image(directory, image["transfer"])
-                if image["transfer"] != image["digest"]:
-                    # Carry the approved index so import can check the platform image is listed in it.
-                    index = run("skopeo", "inspect", "--raw", *options("UPSTREAM"),
-                                "docker://" + transport_reference(image["source"]))
-                    (directory / f"{image['digest'][7:]}.manifest.json").write_bytes(index)
-                    verify_platform(directory, image)
-            write_json(stage / "images.json", {"schema": 1, "stream": state["stream"],
-                       "sequence": state["sequence"], "full": full, "images": changed})
-            bundle = outbox / f"quay-{state['stream']}-{state['sequence']:012d}.tar"
-            temporary_bundle = bundle.with_suffix(".tmp")
-            with tarfile.open(temporary_bundle, "w") as archive:
-                for item in sorted(stage.rglob("*")):
-                    if item.is_file():
-                        archive.add(item, arcname=str(item.relative_to(stage)), recursive=False)
-            os.replace(temporary_bundle, bundle)
-            sidecar = bundle.with_name(bundle.name + ".sha256")
-            temporary_sidecar = sidecar.with_suffix(".tmp")
-            temporary_sidecar.write_text(f"{sha256(bundle)}  {bundle.name}\n")
-            os.replace(temporary_sidecar, sidecar)  # readiness marker, published last
-        notify(bundle)
+                except MirrorError:
+                    if kind != "resend":
+                        raise
+                    # Low Quay lost it: a resend takes the same digest from upstream.
+                    shutil.rmtree(directory, ignore_errors=True)
+                    upstream = transport_reference(image["source"]).rsplit("@", 1)[0]
+                    copy(f"docker://{upstream}@{image['transfer']}", f"dir:{directory}", "UPSTREAM")
+                verify_image(directory, image["transfer"])
+            if image["transfer"] != image["digest"]:
+                # Carry the approved index so import can check the platform image is listed in it.
+                index = run("skopeo", "inspect", "--raw", *options("UPSTREAM"),
+                            "docker://" + transport_reference(image["source"]))
+                (directory / f"{image['digest'][7:]}.manifest.json").write_bytes(index)
+                verify_platform(directory, image)
+        write_json(stage / "images.json", metadata)
+        bundle = outbox / f"quay-{state['stream']}-{state['sequence']:012d}.tar"
+        temporary_bundle = bundle.with_suffix(".tmp")
+        with tarfile.open(temporary_bundle, "w") as archive:
+            for item in sorted(stage.rglob("*")):
+                if item.is_file():
+                    archive.add(item, arcname=str(item.relative_to(stage)), recursive=False)
+        os.replace(temporary_bundle, bundle)
+        sidecar = bundle.with_name(bundle.name + ".sha256")
+        temporary_sidecar = sidecar.with_suffix(".tmp")
+        temporary_sidecar.write_text(f"{sha256(bundle)}  {bundle.name}\n")
+        os.replace(temporary_sidecar, sidecar)  # readiness marker, published last
+    if ledger_enabled():
+        created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        record = metadata | {"created": created, "kind": kind, "bundle": bundle.name}
+        package_put(LEDGER, f"{state['sequence']:012d}", "images.json",
+                    json.dumps(record, indent=2, sort_keys=True).encode())
+    notify(bundle, kind)
+    if kind != "resend":  # a resend repeats what the ledger already records
         state["sent"].update({f"{i['target']}:{i['tag']}": f"{i['digest']} {platform}".strip() for i in changed})
         aliases = state.setdefault("aliases", {})
         for i in changed:
@@ -471,10 +602,63 @@ def sync(path, full=False):
                 aliases[f"{i['target']}:{i['tag']}"] = i["tags"][1:]
             else:
                 aliases.pop(f"{i['target']}:{i['tag']}", None)
-        state["pending"] = False
-        write_json(state_file, state)
-        print(f"bundle: {bundle} ({len(changed)} image(s), {bundle.stat().st_size} bytes)")
-        return bundle
+    state["pending"] = False
+    save_state(state_file, state)
+    print(f"bundle: {bundle} ({len(changed)} image(s), {bundle.stat().st_size} bytes)")
+    return bundle
+
+
+def sequence_range(text, last):
+    """N, N.. or N..M as an inclusive range; an open end means the newest bundle."""
+    match = re.fullmatch(r"([0-9]+)(\.\.([0-9]*))?", text or "")
+    if not match:
+        raise MirrorError(f"--sequence {text!r}: expected N, N.. or N..M")
+    first = int(match[1])
+    final = int(match[3]) if match[3] else (last if match[2] else first)
+    if not 1 <= first <= final:
+        raise MirrorError(f"--sequence {text!r}: empty range")
+    return first, final
+
+
+def export(since=None, sequences=None, image=None):
+    """Resend recorded images as the next bundle: by date, by sequence or by target."""
+    if not ledger_enabled():
+        raise MirrorError("export reads the ledger; set MIRROR_LEDGER=true")
+    if since and not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", since):
+        raise MirrorError(f"--since {since!r}: expected YYYY-MM-DD")
+    if not (since or sequences or image):
+        raise MirrorError("export needs --since, --sequence or --image")
+    low = registry("LOW_QUAY")
+    work = state_path("MIRROR_STATE_DIR", "quay-mirror")
+    with locked(work):
+        state_file = work / "sent.json"
+        state = load_state(state_file)
+        if not state or not state["sequence"]:
+            raise MirrorError("the ledger records no bundle yet; run sync first")
+        if state.get("registry") != low:
+            raise MirrorError("the ledger belongs to another low registry")
+        first, final = sequence_range(sequences, state["sequence"]) if sequences else (1, state["sequence"])
+        latest, wanted, matched = {}, set(), []
+        for record in ledger_records(state["sequence"]):
+            in_range = (first <= record["sequence"] <= final
+                        and (not since or record["created"][:10] >= since))
+            if in_range:
+                matched.append(record["sequence"])
+            for item in record["images"]:
+                key = f"{item['target']}:{item['tag']}"
+                latest[key] = item
+                if in_range and (not image or image in (item["target"], key)):
+                    wanted.add(key)
+        if not wanted:
+            print("nothing recorded matches; no bundle written")
+            return None
+        # The newest record of each tag: an older digest would roll a moved tag back on the high side.
+        chosen = [latest[key] for key in sorted(wanted)]
+        for item in chosen:
+            print(f"resend: {item['target']}:{', :'.join(item['tags'])} {item['transfer']}")
+        # Everything recorded from the first match to the newest bundle stands in for those bundles.
+        bridges = matched[0] if not image and final >= state["sequence"] else None
+        return send(work, state_file, state, low, chosen, False, "resend", bridges)
 
 
 def extract(bundle, directory):
@@ -501,7 +685,9 @@ def validate_manifest(manifest):
             or not re.fullmatch(r"[0-9a-f]{32}", manifest["stream"])
             or type(manifest.get("sequence")) is not int or manifest["sequence"] < 1
             or type(manifest.get("full")) is not bool
-            or not isinstance(manifest.get("images"), list) or not manifest["images"]):
+            or not isinstance(manifest.get("images"), list) or not manifest["images"]
+            or ("from" in manifest and (type(manifest["from"]) is not int
+                                        or not 1 <= manifest["from"] < manifest["sequence"]))):
         raise MirrorError("invalid bundle metadata")
     seen = set()
     for image in manifest["images"]:
@@ -556,8 +742,11 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
                 print(f"superseded: {bundle.name}")
                 return
             raise MirrorError("stale or conflicting bundle; refusing rollback")
-        if manifest["sequence"] != previous + 1 and not manifest["full"]:
-            raise SequenceGap("missing earlier bundle; recover with sync --full")
+        # A resend from the low side's export stands in for every bundle from manifest["from"] on.
+        if (manifest["sequence"] != previous + 1 and not manifest["full"]
+                and manifest.get("from", previous + 2) > previous + 1):
+            raise SequenceGap(f"missing earlier bundle {previous + 1}; on the low side run "
+                              f"mirror.py export --sequence {previous + 1}.. or sync --full")
         for image in manifest["images"]:
             for tag in image["tags"]:
                 destination = f"docker://{high}/{image['target']}:{tag}"
@@ -593,6 +782,93 @@ def import_inbox(inbox, adopt_stream=False):
         consume(bundle)
 
 
+def import_registry(name=None, adopt_stream=False):
+    """Import bundles NiFi uploaded to this project's generic package registry, oldest first.
+
+    name is the file a trigger announces. The receipt names the next sequence, so bundles
+    whose trigger never arrived are fetched too. A bundle missing either file waits.
+    """
+    work = state_path("IMPORT_STATE_DIR", "quay-mirror-import")
+    downloads = work / "downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+
+    def consume(stem, quiet=False):
+        bundle = downloads / f"{stem}.tar"
+        for path in (bundle.with_name(bundle.name + ".sha256"), bundle):
+            if not package_get(BUNDLES, stem, path.name, path):
+                if not quiet:
+                    print(f"waiting for {path.name}")
+                return False
+        import_one(bundle, adopt_stream, superseded_ok=True)
+        for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
+            path.unlink()
+        return True
+
+    match = BUNDLE_NAME.fullmatch(name or "")
+    if name and not match:
+        raise MirrorError(f"{name!r} is not a bundle name")
+    receipt_file = work / "received.json"
+    receipt = json.loads(receipt_file.read_text()) if receipt_file.exists() else {}
+    # Catch up from the receipt, or on a first import from the start of the announced stream.
+    stream = receipt.get("stream") or (match[1].split("-")[1] if match else None)
+    if stream:
+        sequence = receipt.get("sequence", 0) + 1
+        while consume(f"quay-{stream}-{sequence:012d}", quiet=True):
+            sequence += 1
+    if match:
+        consume(match[1])
+
+
+def references(files):
+    """Image references in Containerfiles (FROM) and manifests or rendered charts (image:)."""
+    found = []
+    for name in files:
+        text = sys.stdin.read() if name == "-" else Path(name).read_text()
+        stages = set()
+        for number, line in enumerate(text.splitlines(), 1):
+            match = re.match(r"\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", line, re.IGNORECASE)
+            if match:
+                # An earlier stage, not an image; checked before this line's own alias is known.
+                if match[1].lower() not in stages and match[1] != "scratch":
+                    found.append((match[1], f"{name}:{number}"))
+                if match[2]:
+                    stages.add(match[2].lower())
+                continue
+            match = re.match(r"\s*(?:-\s*)?image:\s*[\"']?([^\"'\s#]+)", line)
+            if match:
+                found.append((match[1], f"{name}:{number}"))
+    return found
+
+
+def covers(path, files):
+    """Fail when a referenced image is neither in the catalog nor ever sent, upstream or high-side name."""
+    images = catalog(path)
+    if ledger_enabled():
+        state = load_state(Path(os.devnull))
+        images += [i for r in ledger_records(state["sequence"] if state else 0) for i in r["images"]]
+    names, targets, digests = set(), set(), set()
+    for image in images:
+        names.add(image["source"].split("@")[0])
+        targets.update(f"{image['target']}:{tag}" for tag in image.get("tags", [image["tag"]]))
+        digests.update({image["digest"], image.get("transfer", image["digest"])})
+    missing = 0
+    for reference, where in references(files):
+        if "$" in reference:
+            print(f"skipped: {reference} ({where}) is built from a variable", file=sys.stderr)
+            continue
+        name, _, digest = reference.partition("@")
+        name = normalise(name)
+        if ":" not in name.rsplit("/", 1)[-1]:
+            name += ":latest"
+        if digest in digests or name in names or name.split("/", 1)[1] in targets:
+            continue
+        print(f"missing: {reference} ({where})")
+        missing += 1
+    if missing:
+        raise MirrorError(f"{missing} image(s) not in the mirror catalog; add them with mirror.py add")
+    print("every image is in the mirror catalog")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", type=Path, default=ROOT / "images.txt")
@@ -609,7 +885,16 @@ def main(argv=None):
     selection = high.add_mutually_exclusive_group(required=True)
     selection.add_argument("bundle", nargs="?", type=Path)
     selection.add_argument("--inbox", type=Path)
+    selection.add_argument("--registry", action="store_true",
+                           help="fetch bundles from this project's generic package registry")
+    high.add_argument("--name", help="with --registry: the bundle file a trigger announced (BUNDLE)")
     high.add_argument("--adopt-stream", action="store_true", help="accept a full bundle from a replacement sender")
+    resend = commands.add_parser("export", help="resend recorded images as the next bundle (MIRROR_LEDGER=true)")
+    resend.add_argument("--since", help="images recorded on or after YYYY-MM-DD")
+    resend.add_argument("--sequence", help="bundles N, N.. (to the newest) or N..M")
+    resend.add_argument("--image", help="one target, org/repo or org/repo:tag")
+    check = commands.add_parser("covers", help="fail when a Containerfile or manifest uses an image the mirror lacks")
+    check.add_argument("files", nargs="+", help="Containerfiles, manifests or - for rendered YAML on stdin")
     args = parser.parse_args(argv)
     if args.verbose:
         os.environ["MIRROR_VERBOSE"] = "true"
@@ -621,6 +906,12 @@ def main(argv=None):
             add_image(args.catalog, args.source, args.target)
         elif args.command == "sync":
             sync(args.catalog, args.full)
+        elif args.command == "export":
+            export(args.since, args.sequence, args.image)
+        elif args.command == "covers":
+            covers(args.catalog, args.files)
+        elif args.registry:
+            import_registry(args.name, args.adopt_stream)
         elif args.inbox:
             import_inbox(args.inbox, args.adopt_stream)
         else:
