@@ -9,8 +9,10 @@ workflow:
 stages: [verify, publish]
 variables:
   PYTHON_IMAGE: 'docker.io/python@sha256:cd7c412d000912f29075a1b8803e43cb2f38bb67f104019df526df5ceaf30569'
-  TRIVY_IMAGE: 'docker.io/aquasec/trivy:0.69.3'
-  TRIVY_SEVERITY: 'CRITICAL'
+  # Debug variants carry a busybox shell; the binaries are /syft and /grype.
+  SYFT_IMAGE: 'docker.io/anchore/syft:v1.54.0-debug'
+  GRYPE_IMAGE: 'docker.io/anchore/grype:v0.120.0-debug'
+  GRYPE_FAIL_ON: 'critical'
   MIRROR_FULL: 'false'
   # Run pipeline with one of these set runs export instead of sync: YYYY-MM-DD, N / N.. / N..M, org/repo[:tag].
   EXPORT_SINCE: ''
@@ -24,38 +26,76 @@ verify:
   script:
     - python3 mirror.py targets
     - python3 -m unittest discover -s tests -v
+    # What sync would send next; sbom and scan check exactly these. The job token reads the ledger.
+    - MIRROR_LEDGER=true python3 mirror.py pending > pending.txt
+    - cat pending.txt
+  artifacts:
+    paths: [pending.txt]
+    expire_in: 1 week
 
-# Renovate's merge requests merge themselves only when this passes. Charts carry no packages to scan.
-scan:
+.gate: &gate
   stage: verify
-  image:
-    name: $TRIVY_IMAGE
-    entrypoint: ['']
-  variables:
-    GIT_DEPTH: '0'
-  script:
-    - |
-      git diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA" -- images.txt | sed -n 's/^+\([^+#[:space:]][^[:space:]]*\)[[:space:]].*/\1/p' > added.txt
-      failed=0
-      while read -r source; do
-        name="${source%@*}"; reference="${name%:*}@${source#*@}"  # the pinned digest, not the tag
-        echo "scanning $source"
-        set +e
-        trivy image --quiet --scanners vuln --severity "$TRIVY_SEVERITY" --ignore-unfixed --exit-code 3 \
-          --platform "${MIRROR_PLATFORM:-linux/amd64}" "$reference" 2> trivy.err
-        code=$?
-        set -e
-        if [ "$code" -eq 3 ]; then failed=1
-        elif [ "$code" -ne 0 ]; then
-          if grep -q 'unsupported artifact type "application/vnd.cncf.helm.config' trivy.err; then echo "chart, not scanned: $source"
-          else cat trivy.err; failed=1; fi
-        fi
-      done < added.txt
-      exit "$failed"
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - images.txt
+        - mirror.py
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+
+# One CycloneDX SBOM per pending image, for the platform the mirror carries. Charts hold no packages.
+sbom:
+  <<: *gate
+  image:
+    name: $SYFT_IMAGE
+    entrypoint: ['']
+  needs: [verify]
+  script:
+    - |
+      mkdir -p sbom
+      failed=0
+      while read -r source; do
+        name="${source%@*}"; digest="${source#*@}"; reference="${name%:*}@$digest"
+        file="sbom/$(echo "$digest" | tr : -).cdx.json"
+        echo "sbom: $source"
+        if ! /syft scan "registry:$reference" --platform "${MIRROR_PLATFORM:-linux/amd64}" \
+            -o "cyclonedx-json=$file" 2> syft.err; then
+          rm -f "$file"
+          if grep -q 'application/vnd.cncf.helm' syft.err; then
+            echo "chart, no packages to list: $source"
+          else
+            cat syft.err; failed=1
+          fi
+        fi
+      done < pending.txt
+      exit "$failed"
+  artifacts:
+    paths: [sbom/]
+    expire_in: 1 week
+
+# Renovate's merge requests merge themselves only when this passes, and sync waits for it.
+scan:
+  <<: *gate
+  image:
+    name: $GRYPE_IMAGE
+    entrypoint: ['']
+    docker:
+      user: root  # the image runs as uid 65532, which cannot write the job's checkout
+  needs: [sbom]
+  script:
+    - |
+      failed=0
+      for file in sbom/*.cdx.json; do
+        [ -e "$file" ] || continue
+        echo "grype: $file"
+        /grype "sbom:$file" --only-fixed --fail-on "$GRYPE_FAIL_ON" -o table \
+          -o "json=${file%.cdx.json}.grype.json" || failed=1
+      done
+      exit "$failed"
+  artifacts:
+    when: always
+    paths: [sbom/]
+    expire_in: 1 week
 
 # A protected shell runner. The ledger keeps sender state in this project's package registry.
 # Merge-request validation runs elsewhere, without registry credentials or state.
@@ -69,6 +109,8 @@ sync: &mirror
   needs:
     - job: verify
       artifacts: false
+    - job: scan
+      artifacts: true
   variables:
     # sent.json lives in this project's package registry, so any mirror runner can take the next run.
     MIRROR_LEDGER: 'true'
@@ -86,6 +128,15 @@ sync: &mirror
       else
         python3 mirror.py sync
       fi
+    # Keep each sent image's SBOM and scan report, by digest, for audit.
+    - |
+      for file in sbom/*.json; do
+        [ -e "$file" ] || continue
+        base=$(basename "$file"); version=${base%%.*}
+        curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" \
+          "${GITLAB_API_URL:-$CI_API_V4_URL}/projects/$CI_PROJECT_ID/packages/generic/quay-mirror-sbom/$version/$base"
+        echo "kept: quay-mirror-sbom/$version/$base"
+      done
   after_script:
     - rm -f "$CI_PROJECT_DIR/.registry-auth.json"
   rules:
@@ -108,6 +159,9 @@ sync: &mirror
 # Run pipeline with EXPORT_SINCE, EXPORT_SEQUENCE or EXPORT_IMAGE resends recorded images as the next bundle.
 export:
   <<: *mirror
+  needs:
+    - job: verify
+      artifacts: false
   script:
     - printf '%s' "$LOW_QUAY_PASSWORD" | skopeo login --tls-verify="${LOW_QUAY_TLS_VERIFY:-true}" --username "$LOW_QUAY_USERNAME" --password-stdin "$LOW_QUAY_HOST"
     - |

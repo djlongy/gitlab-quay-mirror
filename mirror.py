@@ -191,7 +191,10 @@ def package_request(method, package, version, name, data=None):
     base, (key, value) = packages()
     url = f"{base}/{package}/{version}/{urllib.parse.quote(name)}"
     say(f"+ {method} {url}")
-    context = ssl.create_default_context(cafile=os.environ.get("CA_BUNDLE") or None)
+    context = ssl.create_default_context()
+    # A private CA, added to the system roots: CA_BUNDLE, or the one a runner with tls-ca-file hands every job.
+    for bundle in {os.environ.get("CA_BUNDLE"), os.environ.get("CI_SERVER_TLS_CA_FILE")} - {None, ""}:
+        context.load_verify_locations(cafile=bundle)
     request = urllib.request.Request(url, data=data, method=method, headers={key: value})
     return urllib.request.urlopen(request, timeout=600, context=context)
 
@@ -819,6 +822,16 @@ def import_registry(name=None, adopt_stream=False):
         consume(match[1])
 
 
+def pending(path):
+    """Catalog entries the ledger has not sent at their current digest and platform: what sync sends next."""
+    platform = os.environ.get("MIRROR_PLATFORM", "").strip()
+    state = load_state(Path(os.devnull)) if ledger_enabled() else None
+    sent = (state or {}).get("sent", {})
+    for image in catalog(path):
+        if sent.get(f"{image['target']}:{image['tag']}") != f"{image['digest']} {platform}".strip():
+            print(image["source"])
+
+
 def references(files):
     """Image references in Containerfiles (FROM) and manifests or rendered charts (image:)."""
     found = []
@@ -893,6 +906,7 @@ def main(argv=None):
     resend.add_argument("--since", help="images recorded on or after YYYY-MM-DD")
     resend.add_argument("--sequence", help="bundles N, N.. (to the newest) or N..M")
     resend.add_argument("--image", help="one target, org/repo or org/repo:tag")
+    commands.add_parser("pending", help="list catalog sources the ledger has not sent yet, one per line")
     check = commands.add_parser("covers", help="fail when a Containerfile or manifest uses an image the mirror lacks")
     check.add_argument("files", nargs="+", help="Containerfiles, manifests or - for rendered YAML on stdin")
     args = parser.parse_args(argv)
@@ -908,6 +922,8 @@ def main(argv=None):
             sync(args.catalog, args.full)
         elif args.command == "export":
             export(args.since, args.sequence, args.image)
+        elif args.command == "pending":
+            pending(args.catalog)
         elif args.command == "covers":
             covers(args.catalog, args.files)
         elif args.registry:
