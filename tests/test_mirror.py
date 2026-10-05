@@ -836,6 +836,22 @@ class LedgerTest(unittest.TestCase):
                            f'X-Artifact-Format: {form}', f'X-Sha256: {mirror.sha256(path)}', f'Filename: {path.name}'):
                 self.assertIn(header, headers)
 
+    def test_pending_lists_what_the_ledger_has_not_sent(self):
+        files = self.store()
+        sent, fresh = 'sha256:' + 'a'*64, 'sha256:' + 'b'*64
+        path = self.root / 'images.txt'
+        path.write_text(f'docker.io/library/alpine:3.20@{sent} mirror/alpine\n'
+                        f'docker.io/library/busybox:1.37@{fresh} mirror/busybox\n')
+        files[('quay-mirror-ledger', 'head', 'state.json')] = json.dumps(
+            {'sent': {'mirror/alpine:3.20': sent, 'mirror/busybox:1.37': 'sha256:' + 'c'*64}}).encode()
+        with mock.patch('builtins.print') as said:
+            mirror.pending(path)
+        self.assertEqual([c.args[0] for c in said.call_args_list], [f'docker.io/library/busybox:1.37@{fresh}'])
+        os.environ['MIRROR_PLATFORM'] = 'linux/amd64'  # a platform change resends, so both are pending
+        with mock.patch('builtins.print') as said:
+            mirror.pending(path)
+        self.assertEqual(len(said.call_args_list), 2)
+
     def test_helm_charts_are_catalog_entries_without_a_platform(self):
         chart = {'schemaVersion': 2, 'config': {'mediaType': mirror.CHART_CONFIG},
                  'layers': [{'mediaType': mirror.CHART_LAYERS[0]}]}
