@@ -1,8 +1,13 @@
 ---
 # Select this file as the CI configuration path in a separate high-side project.
+# NiFi uploads each bundle to this project's generic package registry, then starts a pipeline
+# through the API with BUNDLE set to the uploaded file name. A schedule catches up on any it missed.
 workflow:
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE =~ /^(schedule|web|api)$/'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE =~ /^(schedule|web|api|trigger)$/'
+
+variables:
+  BUNDLE: ''
 
 stages: [verify, publish]
 default:
@@ -26,7 +31,12 @@ import:
   variables:
     REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
   script:
-    - printf '%s' "$HIGH_QUAY_PASSWORD" | skopeo login --username "$HIGH_QUAY_USERNAME" --password-stdin "$HIGH_QUAY_HOST"
-    - python3 mirror.py import --inbox "${IMPORT_INBOX_DIR:?Set IMPORT_INBOX_DIR to the transfer inbox}"
+    - printf '%s' "$HIGH_QUAY_PASSWORD" | skopeo login --tls-verify="${HIGH_QUAY_TLS_VERIFY:-true}" --username "$HIGH_QUAY_USERNAME" --password-stdin "$HIGH_QUAY_HOST"
+    - |
+      if [ -n "${IMPORT_INBOX_DIR:-}" ]; then
+        python3 mirror.py import --inbox "$IMPORT_INBOX_DIR"
+      else
+        python3 mirror.py import --registry ${BUNDLE:+--name "$BUNDLE"}
+      fi
   after_script:
     - rm -f "$CI_PROJECT_DIR/.registry-auth.json"

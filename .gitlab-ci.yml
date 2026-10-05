@@ -9,7 +9,13 @@ workflow:
 stages: [verify, publish]
 variables:
   PYTHON_IMAGE: 'docker.io/python@sha256:cd7c412d000912f29075a1b8803e43cb2f38bb67f104019df526df5ceaf30569'
+  TRIVY_IMAGE: 'docker.io/aquasec/trivy:0.69.3'
+  TRIVY_SEVERITY: 'CRITICAL'
   MIRROR_FULL: 'false'
+  # Run pipeline with one of these set runs export instead of sync: YYYY-MM-DD, N / N.. / N..M, org/repo[:tag].
+  EXPORT_SINCE: ''
+  EXPORT_SEQUENCE: ''
+  EXPORT_IMAGE: ''
 
 verify:
   stage: verify
@@ -19,9 +25,41 @@ verify:
     - python3 mirror.py targets
     - python3 -m unittest discover -s tests -v
 
-# A protected shell runner. Its home directory keeps MIRROR_STATE_DIR between jobs.
+# Renovate's merge requests merge themselves only when this passes. Charts carry no packages to scan.
+scan:
+  stage: verify
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: ['']
+  variables:
+    GIT_DEPTH: '0'
+  script:
+    - |
+      git diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA" -- images.txt | sed -n 's/^+\([^+#[:space:]][^[:space:]]*\)[[:space:]].*/\1/p' > added.txt
+      failed=0
+      while read -r source; do
+        name="${source%@*}"; reference="${name%:*}@${source#*@}"  # the pinned digest, not the tag
+        echo "scanning $source"
+        set +e
+        trivy image --quiet --scanners vuln --severity "$TRIVY_SEVERITY" --ignore-unfixed --exit-code 3 \
+          --platform "${MIRROR_PLATFORM:-linux/amd64}" "$reference" 2> trivy.err
+        code=$?
+        set -e
+        if [ "$code" -eq 3 ]; then failed=1
+        elif [ "$code" -ne 0 ]; then
+          if grep -q 'unsupported artifact type "application/vnd.cncf.helm.config' trivy.err; then echo "chart, not scanned: $source"
+          else cat trivy.err; failed=1; fi
+        fi
+      done < added.txt
+      exit "$failed"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - images.txt
+
+# A protected shell runner. The ledger keeps sender state in this project's package registry.
 # Merge-request validation runs elsewhere, without registry credentials or state.
-sync:
+sync: &mirror
   stage: publish
   environment:
     name: mirror-low
@@ -32,13 +70,15 @@ sync:
     - job: verify
       artifacts: false
   variables:
+    # sent.json lives in this project's package registry, so any mirror runner can take the next run.
+    MIRROR_LEDGER: 'true'
     # A CI job has no XDG_RUNTIME_DIR, so skopeo's default auth file is not writable.
     REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
   script:
-    - printf '%s' "$LOW_QUAY_PASSWORD" | skopeo login --username "$LOW_QUAY_USERNAME" --password-stdin "$LOW_QUAY_HOST"
+    - printf '%s' "$LOW_QUAY_PASSWORD" | skopeo login --tls-verify="${LOW_QUAY_TLS_VERIFY:-true}" --username "$LOW_QUAY_USERNAME" --password-stdin "$LOW_QUAY_HOST"
     - |
       if [ -n "${UPSTREAM_USERNAME:-}" ]; then
-        printf '%s' "$UPSTREAM_PASSWORD" | skopeo login --username "$UPSTREAM_USERNAME" --password-stdin "${UPSTREAM_REGISTRY:-docker.io}"
+        printf '%s' "$UPSTREAM_PASSWORD" | skopeo login --tls-verify="${UPSTREAM_TLS_VERIFY:-true}" --username "$UPSTREAM_USERNAME" --password-stdin "${UPSTREAM_REGISTRY:-docker.io}"
       fi
     - |
       if [ "$MIRROR_FULL" = "true" ]; then
@@ -51,9 +91,33 @@ sync:
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never
+    # One variable per rule: GitLab 18.9 evaluates `$A || $B` false when A is declared empty above.
+    - if: '$EXPORT_SINCE != null && $EXPORT_SINCE != ""'
+      when: never
+    - if: '$EXPORT_SEQUENCE != null && $EXPORT_SEQUENCE != ""'
+      when: never
+    - if: '$EXPORT_IMAGE != null && $EXPORT_IMAGE != ""'
+      when: never
     - if: '$CI_PIPELINE_SOURCE =~ /^(schedule|web|api)$/'
     - if: '$CI_PIPELINE_SOURCE == "push"'
       changes:
         - images.txt
         - mirror.py
         - .gitlab-ci.yml
+
+# Run pipeline with EXPORT_SINCE, EXPORT_SEQUENCE or EXPORT_IMAGE resends recorded images as the next bundle.
+export:
+  <<: *mirror
+  script:
+    - printf '%s' "$LOW_QUAY_PASSWORD" | skopeo login --tls-verify="${LOW_QUAY_TLS_VERIFY:-true}" --username "$LOW_QUAY_USERNAME" --password-stdin "$LOW_QUAY_HOST"
+    - |
+      if [ -n "${UPSTREAM_USERNAME:-}" ]; then
+        printf '%s' "$UPSTREAM_PASSWORD" | skopeo login --tls-verify="${UPSTREAM_TLS_VERIFY:-true}" --username "$UPSTREAM_USERNAME" --password-stdin "${UPSTREAM_REGISTRY:-docker.io}"
+      fi
+    - python3 mirror.py export ${EXPORT_SINCE:+--since "$EXPORT_SINCE"} ${EXPORT_SEQUENCE:+--sequence "$EXPORT_SEQUENCE"} ${EXPORT_IMAGE:+--image "$EXPORT_IMAGE"}
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $EXPORT_SINCE != null && $EXPORT_SINCE != ""'
+    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $EXPORT_SEQUENCE != null && $EXPORT_SEQUENCE != ""'
+    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $EXPORT_IMAGE != null && $EXPORT_IMAGE != ""'

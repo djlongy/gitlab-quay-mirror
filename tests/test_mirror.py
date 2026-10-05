@@ -710,5 +710,170 @@ class MirrorTest(unittest.TestCase):
             self.assertEqual(metadata['sequence'], 3)
 
 
+
+class LedgerTest(unittest.TestCase):
+    """The GitLab-package ledger, resend and registry import, against an in-memory package store."""
+
+    setUp = MirrorTest.setUp
+    latest_entry = MirrorTest.latest_entry
+    bundled_tags = MirrorTest.bundled_tags
+
+    def store(self):
+        files = {}
+
+        def get(package, version, name, destination=None):
+            data = files.get((package, version, name))
+            if data is None or destination is None:
+                return data
+            Path(destination).write_bytes(data)
+            return destination
+
+        def put(package, version, name, data):
+            files[(package, version, name)] = data
+
+        os.environ['MIRROR_LEDGER'] = 'true'
+        for name, fake in (('package_get', get), ('package_put', put)):
+            patcher = mock.patch.object(mirror, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return files
+
+    def manifest(self, bundle):
+        with tarfile.open(bundle) as archive:
+            return json.load(archive.extractfile('images.json'))
+
+    def test_a_lost_runner_resumes_from_the_ledger_and_resends_by_sequence_or_image(self):
+        files = self.store()
+        path, _, fake_copy, fake_digest = self.latest_entry()
+        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
+                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
+                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest):
+            first = mirror.sync(path)
+            record = json.loads(files[('quay-mirror-ledger', '000000000001', 'images.json')])
+            self.assertEqual((record['kind'], record['bundle'], record['sequence']), ('full', first.name, 1))
+            self.assertRegex(record['created'], r'^\d{4}-\d\d-\d\dT')
+            shutil.rmtree(self.root / 'work')  # the runner and its sent.json are gone
+            self.assertIsNone(mirror.sync(path))
+            by_image = self.manifest(mirror.export(image='mirror/alpine'))
+            self.assertEqual((by_image['sequence'], by_image['full'], 'from' in by_image), (2, False, False))
+            by_range = self.manifest(mirror.export(sequences='1..'))
+            self.assertEqual((by_range['sequence'], by_range['from']), (3, 1))
+            self.assertIsNone(mirror.export(since='2999-01-01'))
+        self.assertEqual(json.loads(files[('quay-mirror-ledger', 'head', 'state.json')])['sequence'], 3)
+        for bad in ({}, {'since': 'yesterday'}, {'sequences': '3..1'}):
+            with self.subTest(bad), self.assertRaises(mirror.MirrorError):
+                mirror.export(**bad)
+
+    def test_a_resend_carries_the_newest_digest_of_each_tag(self):
+        files = self.store()
+        old, new = 'sha256:' + 'a'*64, 'sha256:' + 'b'*64
+
+        def entry(digest):
+            image = mirror.parse_image(f'docker.io/bitnami/redis:latest@{digest}', 'mirror/redis')
+            return image | {'transfer': digest, 'tags': ['latest']}
+
+        for sequence, digest, created in ((1, old, '2026-09-01T00:00:00Z'), (2, new, '2026-10-01T00:00:00Z')):
+            files[('quay-mirror-ledger', f'{sequence:012d}', 'images.json')] = json.dumps(
+                {'sequence': sequence, 'created': created, 'images': [entry(digest)]}).encode()
+        files[('quay-mirror-ledger', 'head', 'state.json')] = json.dumps(
+            {'stream': 'a'*32, 'sequence': 2, 'sent': {}, 'registry': 'low.example.internal'}).encode()
+        with mock.patch.object(mirror, 'send') as send:
+            mirror.export(since='2026-08-01')
+        self.assertEqual([i['transfer'] for i in send.call_args.args[4]], [new])
+        self.assertEqual(send.call_args.args[6:], ('resend', 1))
+
+    def test_import_accepts_a_resend_only_over_the_gap_it_covers(self):
+        image, _ = fixture(self.stage)
+        bundle = self.root / 'quay-1.tar'
+        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
+            pack(self.stage, bundle, image=image)
+            mirror.import_one(bundle)
+            for start, sequence in ((3, 4), (99, 4)):
+                pack(self.stage, bundle, image=image, sequence=sequence, full=False)
+                metadata = json.loads((self.stage / 'images.json').read_text()) | {'from': start}
+                (self.stage / 'images.json').write_text(json.dumps(metadata))
+                pack_metadata(self.stage, bundle)
+                with self.subTest(start=start), self.assertRaises(mirror.MirrorError):
+                    mirror.import_one(bundle)
+            metadata['from'] = 2
+            (self.stage / 'images.json').write_text(json.dumps(metadata))
+            pack_metadata(self.stage, bundle)
+            mirror.import_one(bundle)
+        self.assertEqual(json.loads((self.root / 'import/received.json').read_text())['sequence'], 4)
+
+    def test_registry_import_catches_up_on_missed_triggers_and_waits_for_half_a_bundle(self):
+        files = self.store()
+        image, _ = fixture(self.stage)
+        stream = 'c' * 32
+        for sequence in (1, 2, 3):
+            stem = f'quay-{stream}-{sequence:012d}'
+            pack(self.stage, self.root / f'{stem}.tar', sequence=sequence, full=sequence == 1, image=image, stream=stream)
+            for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
+                if (sequence, name[-6:]) != (3, 'sha256'):  # bundle 3's checksum has not arrived
+                    files[('quay-bundles', stem, name)] = (self.root / name).read_bytes()
+        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
+                mock.patch('builtins.print') as said:
+            # The first trigger was lost: the second still imports bundle 1 before bundle 2.
+            mirror.import_registry(f'quay-{stream}-000000000002.tar')
+            mirror.import_registry(f'quay-{stream}-000000000003.tar')
+        self.assertEqual(json.loads((self.root / 'import/received.json').read_text())['sequence'], 2)
+        self.assertIn(mock.call(f'waiting for quay-{stream}-000000000003.tar.sha256'), said.call_args_list)
+        with self.assertRaisesRegex(mirror.MirrorError, 'not a bundle name'):
+            mirror.import_registry('../../etc/passwd')
+
+    def test_notify_sends_the_routing_headers(self):
+        bundle = self.root / 'quay-x.tar'
+        bundle.write_bytes(b'tar')
+        bundle.with_name(bundle.name + '.sha256').write_text('sum\n')
+        os.environ['NIFI_URL'] = 'http://nifi.example.internal:9099/contentListener'
+        with mock.patch.object(mirror, 'run') as call:
+            mirror.notify(bundle, 'resend')
+        sent = [c.args for c in call.call_args_list]
+        self.assertEqual([a[a.index('--data-binary') + 1] for a in sent], [f'@{bundle}.sha256', f'@{bundle}'])
+        for args, form, path in zip(sent, ('sha256', 'tar'), (bundle.with_name(bundle.name + '.sha256'), bundle)):
+            headers = [args[i + 1] for i, a in enumerate(args) if a == '--header']
+            for header in ('X-Artifact-Type: container-images', 'X-Artifact-Action: mirror', 'X-Bundle-Kind: resend',
+                           f'X-Artifact-Format: {form}', f'X-Sha256: {mirror.sha256(path)}', f'Filename: {path.name}'):
+                self.assertIn(header, headers)
+
+    def test_helm_charts_are_catalog_entries_without_a_platform(self):
+        chart = {'schemaVersion': 2, 'config': {'mediaType': mirror.CHART_CONFIG},
+                 'layers': [{'mediaType': mirror.CHART_LAYERS[0]}]}
+        self.assertTrue(mirror.runnable(chart))
+        self.assertFalse(mirror.runnable(chart | {'layers': [{'mediaType': 'text/plain'}]}))
+        self.assertFalse(mirror.runnable(chart | {'layers': [{'mediaType': mirror.CHART_LAYERS[1]}]}))
+        os.environ['MIRROR_PLATFORM'] = 'linux/amd64'
+        with mock.patch.object(mirror, 'run', return_value=json.dumps(chart).encode()) as call:
+            self.assertEqual(mirror.platform_digest('docker://up/chart@sha256:' + 'd'*64, 'sha256:' + 'd'*64, 'UPSTREAM'),
+                             'sha256:' + 'd'*64)
+        self.assertEqual(call.call_count, 1)
+
+    def test_covers_finds_images_the_mirror_lacks(self):
+        digest = 'sha256:' + 'e'*64
+        path = self.root / 'images.txt'
+        path.write_text(f'docker.io/library/alpine:3.20@{digest} team-dev/library/alpine\n')
+        containerfile = self.root / 'Containerfile'
+        containerfile.write_text('ARG BASE=x\nFROM alpine:3.20 AS build\nFROM build\nFROM scratch\nFROM nginx AS nginx\n'
+                                 'FROM --platform=linux/amd64 quay.example.internal/team-dev/library/alpine:3.20\n'
+                                 'FROM ${BASE}\nFROM docker.io/library/busybox@' + digest + '\n')
+        compose = self.root / 'compose.yaml'
+        compose.write_text('services:\n  app:\n    image: "nginx:1.29"\n')
+        with mock.patch('builtins.print') as said:
+            with self.assertRaisesRegex(mirror.MirrorError, '1 image'):
+                mirror.covers(path, [str(containerfile)])  # a stage named like its image is still checked
+            with self.assertRaisesRegex(mirror.MirrorError, '2 image'):
+                mirror.covers(path, [str(containerfile), str(compose)])
+        self.assertIn(mock.call(f'missing: nginx:1.29 ({compose}:3)'), said.call_args_list)
+
+
+def pack_metadata(stage, destination):
+    """Re-pack a stage whose images.json a test edited, with a fresh checksum."""
+    with tarfile.open(destination, 'w') as archive:
+        for path in sorted(stage.rglob('*')):
+            if path.is_file():
+                archive.add(path, arcname=str(path.relative_to(stage)), recursive=False)
+    destination.with_name(destination.name + '.sha256').write_text(f'{mirror.sha256(destination)}  {destination.name}\n')
+
+
 if __name__ == '__main__':
     unittest.main()
