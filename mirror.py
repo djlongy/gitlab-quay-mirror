@@ -467,13 +467,21 @@ def notify(bundle, kind):
     """POST the checksum, then the bundle, to NIFI_URL. The X- headers route it in NiFi, as the pypi mirror's do."""
     url = os.environ.get("NIFI_URL")
     if url:
+        parts = urllib.parse.urlsplit(url)
+        shown = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()  # no credentials in the log
         for path, form in ((bundle.with_name(bundle.name + ".sha256"), "sha256"), (bundle, "tar")):
-            run("curl", "--fail", "--show-error", "--silent", "--connect-timeout", "15",
-                "--max-time", "3600", "--retry", "2", "--request", "POST",
-                "--header", f"Filename: {path.name}", "--header", "Content-Type: application/octet-stream",
-                "--header", f"X-Sha256: {sha256(path)}", "--header", "X-Artifact-Type: container-images",
-                "--header", f"X-Artifact-Format: {form}", "--header", "X-Artifact-Action: mirror",
-                "--header", f"X-Bundle-Kind: {kind}", "--data-binary", f"@{path}", url)
+            checksum = sha256(path)
+            # HTTP/1.1 keeps the header names as written; HTTP/2 would lowercase them and break
+            # a case-sensitive RouteOnAttribute.
+            status = run("curl", "--http1.1", "--fail", "--show-error", "--silent", "--connect-timeout", "15",
+                         "--max-time", "3600", "--retry", "2", "--request", "POST",
+                         "--output", "/dev/null", "--write-out", "%{http_code}",
+                         "--header", f"Filename: {path.name}", "--header", "Content-Type: application/octet-stream",
+                         "--header", f"X-Sha256: {checksum}", "--header", "X-Artifact-Type: container-images",
+                         "--header", f"X-Artifact-Format: {form}", "--header", "X-Artifact-Action: mirror",
+                         "--header", f"X-Bundle-Kind: {kind}", "--data-binary", f"@{path}", url)
+            print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, "
+                  f"{path.stat().st_size} bytes, X-Sha256 {checksum})")
 
 
 def sync(path, full=False):
@@ -534,6 +542,7 @@ def sync(path, full=False):
                         # Missing, deleted or expired: copy it again; a real fault fails the copy below.
                         say(f"low copy unreadable, recopying: {error}")
                 if observed == transfer:
+                    print(f"already in low Quay: {low}/{image['target']}:{tag}@{transfer}")
                     continue
                 if number:  # a version tag points at the image already in low Quay
                     copy(f"docker://{low}/{image['target']}@{transfer}", destination, "LOW_QUAY", "LOW_QUAY")
@@ -541,6 +550,7 @@ def sync(path, full=False):
                     copy("docker://" + source.split("@")[0] + "@" + transfer, destination, "UPSTREAM", "LOW_QUAY")
                 if raw_digest(destination, "LOW_QUAY") != transfer:
                     raise MirrorError(f"low mirror digest mismatch: {image['target']}:{tag}")
+                print(f"pushed to low Quay: {low}/{image['target']}:{tag}@{transfer}")
             names = f"{image['target']}:{', :'.join(tags)}"
             due = full or state["sent"].get(key) != sent or aliases != tags[1:]
             if due:
@@ -777,7 +787,7 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
                      destination_side="HIGH_QUAY")
                 if raw_digest(destination, "HIGH_QUAY") != image["transfer"]:
                     raise MirrorError(f"high mirror digest mismatch: {image['target']}:{tag}")
-                print(f"pushed: {image['target']}:{tag} {image['transfer']}")
+                print(f"pushed to high registry: {high}/{image['target']}:{tag}@{image['transfer']}")
         save_receipt(receipt_file, {"stream": manifest["stream"], "sequence": manifest["sequence"],
                                     "digest": digest, "registry": high})
     print(f"imported: {bundle.name} ({len(manifest['images'])} image(s), digests verified)")

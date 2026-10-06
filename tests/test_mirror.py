@@ -855,10 +855,17 @@ class LedgerTest(unittest.TestCase):
         bundle = self.root / 'quay-x.tar'
         bundle.write_bytes(b'tar')
         bundle.with_name(bundle.name + '.sha256').write_text('sum\n')
-        os.environ['NIFI_URL'] = 'http://nifi.example.internal:9099/contentListener'
-        with mock.patch.object(mirror, 'run') as call:
+        os.environ['NIFI_URL'] = 'http://user:secret@nifi.example.internal:9099/contentListener'
+        with mock.patch.object(mirror, 'run', return_value=b'200') as call, \
+                mock.patch('builtins.print') as said:
             mirror.notify(bundle, 'resend')
         sent = [c.args for c in call.call_args_list]
+        self.assertTrue(all('--http1.1' in args for args in sent))
+        logged = [c.args[0] for c in said.call_args_list]
+        self.assertEqual(len(logged), 2)
+        self.assertTrue(logged[1].startswith(
+            'posted to NiFi: quay-x.tar -> http://nifi.example.internal:9099/contentListener (HTTP 200'))
+        self.assertNotIn('secret', ''.join(logged))
         self.assertEqual([a[a.index('--data-binary') + 1] for a in sent], [f'@{bundle}.sha256', f'@{bundle}'])
         for args, form, path in zip(sent, ('sha256', 'tar'), (bundle.with_name(bundle.name + '.sha256'), bundle)):
             headers = [args[i + 1] for i, a in enumerate(args) if a == '--header']
