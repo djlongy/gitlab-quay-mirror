@@ -821,6 +821,36 @@ class LedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(mirror.MirrorError, 'not a bundle name'):
             mirror.import_registry('../../etc/passwd')
 
+    def test_the_registry_receipt_survives_a_fresh_runner(self):
+        files = self.store()
+        image, _ = fixture(self.stage)
+        stream = 'd' * 32
+        for sequence in (1, 2):
+            stem = f'quay-{stream}-{sequence:012d}'
+            pack(self.stage, self.root / f'{stem}.tar', sequence=sequence, full=sequence == 1, image=image, stream=stream)
+            for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
+                files[('quay-bundles', stem, name)] = (self.root / name).read_bytes()
+        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
+                mock.patch('builtins.print') as said:
+            mirror.import_registry(f'quay-{stream}-000000000001.tar')
+            shutil.rmtree(self.root / 'import')  # the next job runs on a clean runner
+            mirror.import_registry(f'quay-{stream}-000000000001.tar')
+        # Without the registry's receipt the second run would push both bundles again.
+        self.assertEqual(said.call_args_list[-1], mock.call(f'superseded: quay-{stream}-000000000001.tar'))
+        self.assertEqual(json.loads(files[('quay-import-receipt', 'head', 'received.json')])['sequence'], 2)
+
+    def test_a_delivered_bundle_leaves_nothing_on_the_runner(self):
+        self.store()
+        path, _, fake_copy, fake_digest = self.latest_entry()
+        os.environ['NIFI_URL'] = 'http://nifi.example.internal:9098/contentListener'
+        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
+                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
+                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
+                mock.patch.object(mirror, 'notify') as sent:
+            bundle = mirror.sync(path)
+        self.assertEqual(sent.call_args.args[0], bundle)
+        self.assertEqual(list((self.root / 'out').iterdir()), [])
+
     def test_notify_sends_the_routing_headers(self):
         bundle = self.root / 'quay-x.tar'
         bundle.write_bytes(b'tar')

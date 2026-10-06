@@ -32,7 +32,7 @@ IMAGE_LAYER = re.compile(r"application/vnd\.oci\.image\.layer\.(?:nondistributab
 MANIFESTS = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json")
 CHART_CONFIG = "application/vnd.cncf.helm.config.v1+json"
 CHART_LAYERS = ("application/vnd.cncf.helm.chart.content.v1.tar+gzip", "application/vnd.cncf.helm.chart.provenance.v1.prov")
-LEDGER, BUNDLES = "quay-mirror-ledger", "quay-bundles"
+LEDGER, BUNDLES, RECEIPTS = "quay-mirror-ledger", "quay-bundles", "quay-import-receipt"
 BUNDLE_NAME = re.compile(r"(quay-[0-9a-f]{32}-[0-9]{12})\.tar(?:\.sha256)?")
 INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
 
@@ -238,6 +238,20 @@ def save_state(state_file, state, remote=True):
     write_json(state_file, state)
     if remote and ledger_enabled():
         package_put(LEDGER, "head", "state.json", state_file.read_bytes())
+
+
+def load_receipt(receipt_file):
+    """The high side's last import: the registry's copy when MIRROR_LEDGER=true, else received.json."""
+    if ledger_enabled():
+        raw = package_get(RECEIPTS, "head", "received.json")
+        return json.loads(raw) if raw else {}
+    return json.loads(receipt_file.read_text()) if receipt_file.exists() else {}
+
+
+def save_receipt(receipt_file, receipt):
+    write_json(receipt_file, receipt)
+    if ledger_enabled():
+        package_put(RECEIPTS, "head", "received.json", receipt_file.read_bytes())
 
 
 def ledger_records(last):
@@ -596,7 +610,12 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
         record = metadata | {"created": created, "kind": kind, "bundle": bundle.name}
         package_put(LEDGER, f"{state['sequence']:012d}", "images.json",
                     json.dumps(record, indent=2, sort_keys=True).encode())
+    size = bundle.stat().st_size
     notify(bundle, kind)
+    if os.environ.get("NIFI_URL"):
+        # Delivered: the images stay in low Quay and the record in the ledger, so nothing stays on the runner.
+        for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
+            path.unlink()
     if kind != "resend":  # a resend repeats what the ledger already records
         state["sent"].update({f"{i['target']}:{i['tag']}": f"{i['digest']} {platform}".strip() for i in changed})
         aliases = state.setdefault("aliases", {})
@@ -607,7 +626,8 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
                 aliases.pop(f"{i['target']}:{i['tag']}", None)
     state["pending"] = False
     save_state(state_file, state)
-    print(f"bundle: {bundle} ({len(changed)} image(s), {bundle.stat().st_size} bytes)")
+    print(f"bundle: {bundle.name} ({len(changed)} image(s), {size} bytes)"
+          + (", delivered and removed" if os.environ.get("NIFI_URL") else f", left in {bundle.parent}"))
     return bundle
 
 
@@ -729,7 +749,7 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
             verify_image(stage / "images" / image["transfer"].replace(":", "-"), image["transfer"])
             verify_platform(stage / "images" / image["transfer"].replace(":", "-"), image)
         receipt_file = work / "received.json"
-        receipt = json.loads(receipt_file.read_text()) if receipt_file.exists() else {}
+        receipt = load_receipt(receipt_file)
         if receipt and receipt.get("registry") != high:
             raise MirrorError(f"{work} belongs to another high registry; set a separate IMPORT_STATE_DIR")
         if receipt and receipt["stream"] != manifest["stream"]:
@@ -758,8 +778,8 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
                 if raw_digest(destination, "HIGH_QUAY") != image["transfer"]:
                     raise MirrorError(f"high mirror digest mismatch: {image['target']}:{tag}")
                 print(f"pushed: {image['target']}:{tag} {image['transfer']}")
-        write_json(receipt_file, {"stream": manifest["stream"], "sequence": manifest["sequence"],
-                                "digest": digest, "registry": high})
+        save_receipt(receipt_file, {"stream": manifest["stream"], "sequence": manifest["sequence"],
+                                    "digest": digest, "registry": high})
     print(f"imported: {bundle.name} ({len(manifest['images'])} image(s), digests verified)")
 
 
@@ -810,8 +830,7 @@ def import_registry(name=None, adopt_stream=False):
     match = BUNDLE_NAME.fullmatch(name or "")
     if name and not match:
         raise MirrorError(f"{name!r} is not a bundle name")
-    receipt_file = work / "received.json"
-    receipt = json.loads(receipt_file.read_text()) if receipt_file.exists() else {}
+    receipt = load_receipt(work / "received.json")
     # Catch up from the receipt, or on a first import from the start of the announced stream.
     stream = receipt.get("stream") or (match[1].split("-")[1] if match else None)
     if stream:
