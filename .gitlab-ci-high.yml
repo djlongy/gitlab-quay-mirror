@@ -8,10 +8,12 @@ workflow:
 
 variables:
   BUNDLE: ''
+  # Runner tag for every job; empty sends them to any runner that takes untagged jobs.
+  MIRROR_JOB_TAG: ''
 
 stages: [verify, publish]
 default:
-  tags: [quay-mirror-high]
+  tags: [$MIRROR_JOB_TAG]
 
 verify:
   stage: verify

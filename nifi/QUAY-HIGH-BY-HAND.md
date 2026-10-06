@@ -25,7 +25,7 @@ the digest the low side approved. `skopeo copy --preserve-digests` keeps it, and
   the registry API, and it never calls a Quay API.
 - A high GitLab project holding this repository, with **Settings > CI/CD > General
   pipelines > CI/CD configuration file** set to `.gitlab-ci-high.yml`.
-- A protected runner tagged `quay-mirror-high` with `python3` (3.9 or later), `skopeo`
+- A runner that takes untagged jobs (or the one `MIRROR_JOB_TAG` names) with `python3` (3.9 or later), `skopeo`
   and `curl`.
 - Project CI/CD variables, protected and masked, scoped to environment `mirror-high`:
 
