@@ -1,8 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
-  "platformAutomerge": true,
-  "separateMinorPatch": true,
+  "recreateWhen": "always",
   "customManagers": [
     {
       "customType": "regex",
@@ -15,12 +14,6 @@
     }
   ],
   "packageRules": [
-    {"matchManagers": ["custom.regex"], "pinDigests": true},
-    {
-      "description": "Digest, patch and minor updates merge once verify and scan pass; majors wait for review",
-      "matchManagers": ["custom.regex"],
-      "matchUpdateTypes": ["digest", "patch", "minor"],
-      "automerge": true
-    }
+    {"matchManagers": ["custom.regex"], "pinDigests": true}
   ]
 }
