@@ -165,6 +165,11 @@ sync: &mirror
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never
+    # A project without a low Quay is the source repository, not a deployment: nothing to sync.
+    - if: '$LOW_QUAY_HOST == null'
+      when: never
+    - if: '$LOW_QUAY_HOST == ""'
+      when: never
     # One variable per rule: GitLab 18.9 evaluates `$A || $B` false when A is declared empty above.
     - if: '$EXPORT_SINCE != null && $EXPORT_SINCE != ""'
       when: never
@@ -194,6 +199,11 @@ export:
     - python3 mirror.py export ${EXPORT_SINCE:+--since "$EXPORT_SINCE"} ${EXPORT_SEQUENCE:+--sequence "$EXPORT_SEQUENCE"} ${EXPORT_IMAGE:+--image "$EXPORT_IMAGE"}
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
+      when: never
+    # A project without a low Quay is the source repository, not a deployment: nothing to sync.
+    - if: '$LOW_QUAY_HOST == null'
+      when: never
+    - if: '$LOW_QUAY_HOST == ""'
       when: never
     - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $EXPORT_SINCE != null && $EXPORT_SINCE != ""'
     - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $EXPORT_SEQUENCE != null && $EXPORT_SEQUENCE != ""'
