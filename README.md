@@ -5,8 +5,8 @@ Mirrors reviewed images and Helm charts into low Quay and exports offline bundle
 ## Requirements
 
 - Python 3.11+ and skopeo 1.13+ on each side; no Docker daemon or privileged runner.
-- GitLab with an unprivileged Docker runner for verification and a protected shell runner tagged `quay-mirror` for sync.
-- For high-side import, a separate project with CI configuration path `.gitlab-ci-high.yml` and a protected shell runner tagged `quay-mirror-high`.
+- GitLab with a runner that takes untagged jobs, or the one `MIRROR_JOB_TAG` names. `sync` and `export` need `python3`, `skopeo` and `curl` on it (the image on a Docker runner, the host on a shell runner).
+- For high-side import, a separate project with CI configuration path `.gitlab-ci-high.yml` and a runner chosen the same way, with `python3`, `skopeo` and `curl`.
 - For the hands-off path, NiFi 2.x on each side of the transfer link (`nifi/flow.py` builds both flows).
 
 ## Inputs
@@ -24,7 +24,7 @@ Mirrors reviewed images and Helm charts into low Quay and exports offline bundle
 | Optional | `MIRROR_BUNDLE_DIR` | none | Directory that keeps bundles for hand-carry. With neither it nor `NIFI_URL`, `sync` mirrors to low Quay and writes no bundle |
 | Optional | `IMPORT_STATE_DIR` | `~/.local/state/quay-mirror-import`; the job directory in CI | Downloads and, without the ledger, `received.json` |
 | Optional | `MIRROR_SCAN` | `true` | `false` skips `sbom` and `scan`; `sync` then runs without them |
-| Optional | `MIRROR_JOB_TAG` | empty (untagged) | Runner tag for `verify`, `sbom` and `scan`, for example `shell` |
+| Optional | `MIRROR_JOB_TAG` | empty (untagged) | Runner tag for every job, low and high, for example `shell` |
 | In high CI | `IMPORT_INBOX_DIR` | none | Directory holding transferred archive/checksum pairs |
 | Optional | `MIRROR_FULL` | `false` | Set `true` on Run pipeline to resend every approved image |
 | Optional | `EXPORT_SINCE`, `EXPORT_SEQUENCE`, `EXPORT_IMAGE` | none | On Run pipeline, resend instead of sync: `YYYY-MM-DD`, `N`, `N..` or `N..M`, `org/repo[:tag]` |

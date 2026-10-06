@@ -15,7 +15,7 @@ variables:
   GRYPE_FAIL_ON: 'critical'
   # false skips sbom and scan, and sync no longer waits for them.
   MIRROR_SCAN: 'true'
-  # Runner tag for verify, sbom and scan; empty sends them to any runner that takes untagged jobs.
+  # Runner tag for every job; empty sends them to any runner that takes untagged jobs.
   MIRROR_JOB_TAG: ''
   MIRROR_FULL: 'false'
   # Run pipeline with one of these set runs export instead of sync: YYYY-MM-DD, N / N.. / N..M, org/repo[:tag].
@@ -124,7 +124,7 @@ sync: &mirror
   environment:
     name: mirror-low
     action: prepare
-  tags: [quay-mirror]
+  tags: [$MIRROR_JOB_TAG]
   resource_group: quay-mirror
   needs:
     - job: verify
