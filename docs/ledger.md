@@ -54,6 +54,9 @@ always reads as the latest state, and the older uploads remain as history.
    - decides whether it needs sending: its digest, platform or version tags differ from
      what `sent` records. A full sync sends everything.
 3. If nothing needs sending, prints `nothing to send` and stops. No bundle, no new sequence.
+   If something does but neither `NIFI_URL` nor `MIRROR_BUNDLE_DIR` is set, it prints
+   `not sent to the high side` and stops the same way. The ledger records only bundles that
+   left, so the next run with a destination sends them.
 4. Otherwise reserves the next sequence. It writes `pending: true` to the ledger first, so a
    crash cannot reuse the number.
 5. Copies each changed image out of low Quay into the bundle, checks every file against its

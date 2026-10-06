@@ -851,6 +851,35 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(sent.call_args.args[0], bundle)
         self.assertEqual(list((self.root / 'out').iterdir()), [])
 
+    def test_without_a_destination_sync_mirrors_low_and_records_nothing_sent(self):
+        files = self.store()
+        path, _, fake_copy, fake_digest = self.latest_entry()
+        del os.environ['MIRROR_BUNDLE_DIR']
+        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
+                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
+                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
+                mock.patch.object(mirror, 'notify') as sent, \
+                mock.patch('builtins.print') as said:
+            self.assertIsNone(mirror.sync(path))
+        sent.assert_not_called()
+        self.assertIn('not sent to the high side', said.call_args.args[0])
+        state = json.loads(files[('quay-mirror-ledger', 'head', 'state.json')])
+        self.assertEqual((state['sequence'], state['sent']), (0, {}))
+        # Once NiFi is configured, the next sync sends what the first one could not.
+        os.environ['NIFI_URL'] = 'http://nifi.example.internal:9098/contentListener'
+        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
+                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
+                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
+                mock.patch.object(mirror, 'notify') as sent:
+            self.assertIsNotNone(mirror.sync(path))
+        sent.assert_called_once()
+
+    def test_export_refuses_without_a_destination(self):
+        self.store()
+        del os.environ['MIRROR_BUNDLE_DIR']
+        with self.assertRaisesRegex(mirror.MirrorError, 'set NIFI_URL'):
+            mirror.export(sequences='1..')
+
     def test_notify_sends_the_routing_headers(self):
         bundle = self.root / 'quay-x.tar'
         bundle.write_bytes(b'tar')

@@ -559,12 +559,23 @@ def sync(path, full=False):
             else:
                 say(f"unchanged: {names} {transfer}")
         state["platforms"] = platforms
+        if changed and not bundle_destination():
+            # The ledger says what crossed to the high side, so it records only a bundle that left.
+            save_state(state_file, state, remote=json.dumps(state, sort_keys=True) != loaded)
+            print(f"low Quay updated; {len(changed)} image(s) not sent to the high side: "
+                  "set NIFI_URL, or MIRROR_BUNDLE_DIR to hand-carry bundles")
+            return None
         if not changed:
             # A quiet day rewrites the ledger head only when the cached tag choices changed.
             save_state(state_file, state, remote=json.dumps(state, sort_keys=True) != loaded)
             print("nothing to send; low-side digests verified")
             return None
         return send(work, state_file, state, low, changed, full, "full" if full else "delta")
+
+
+def bundle_destination():
+    """Where a bundle goes: NiFi, or a directory someone carries across. None means nowhere."""
+    return os.environ.get("NIFI_URL") or os.environ.get("MIRROR_BUNDLE_DIR")
 
 
 def send(work, state_file, state, low, changed, full, kind, bridges=None):
@@ -661,6 +672,8 @@ def export(since=None, sequences=None, image=None):
         raise MirrorError(f"--since {since!r}: expected YYYY-MM-DD")
     if not (since or sequences or image):
         raise MirrorError("export needs --since, --sequence or --image")
+    if not bundle_destination():
+        raise MirrorError("export writes a bundle; set NIFI_URL, or MIRROR_BUNDLE_DIR to hand-carry it")
     low = registry("LOW_QUAY")
     work = state_path("MIRROR_STATE_DIR", "quay-mirror")
     with locked(work):
