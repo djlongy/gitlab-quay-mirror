@@ -73,7 +73,7 @@ sbom:
     paths: [sbom/]
     expire_in: 1 week
 
-# Renovate's merge requests merge themselves only when this passes, and sync waits for it.
+# A merge request needs this to pass (Pipelines must succeed), and sync waits for it.
 scan:
   <<: *gate
   image:
