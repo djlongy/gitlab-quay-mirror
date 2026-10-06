@@ -86,7 +86,7 @@ python3 mirror.py sync
 
 ## Behaviour
 
-Default-branch catalog/script/pipeline changes, schedules and Run pipeline run sync after verification.
+Default-branch catalog/script/pipeline changes, schedules and Run pipeline run sync after verification. `sync` and `export` run only where `LOW_QUAY_HOST` is set. A project without a low Quay runs the tests and scan only.
 Every sync verifies each tagged low-side copy, version tags included, restores any that is missing and copies new or changed approved digests; unchanged entries need no upstream pull.
 The ledger records the digest and version tags last sent for each destination tag, and only entries where either changed enter a bundle. With `MIRROR_LEDGER=true` it is generic package `quay-mirror-ledger`: `head/state.json`, plus `<sequence>/images.json` for every bundle with its creation time, so any runner can take the next run. Keep one writer at a time: in CI, `sync` and `export` share `resource_group: quay-mirror`; do not run either by hand against the same ledger meanwhile. A daily run with no change prints `nothing to send` and writes no bundle. A bundle that `NIFI_URL` accepted is deleted at once; without `NIFI_URL` it stays in `MIRROR_BUNDLE_DIR` for pickup. `docs/ledger.md` walks through the ledger, sequences, resends and the receipt.
 `mirror.py pending` lists what the next sync sends: catalog entries the ledger has not sent at their current digest and platform. `sbom` writes a CycloneDX SBOM of each with Syft (`MIRROR_PLATFORM`, else `linux/amd64`), `scan` checks it with Grype (`--only-fixed`), and `sync` waits for `scan`. After a sync, each SBOM and Grype report is kept as generic package `quay-mirror-sbom`, version the image digest (`sha256-<hex>`). Charts hold no packages and have neither.
