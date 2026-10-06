@@ -18,11 +18,13 @@ Mirrors reviewed images and Helm charts into low Quay and exports offline bundle
 | For sync | `LOW_QUAY_HOST` | none | Low Quay, as `host[:port]` |
 | For import | `HIGH_QUAY_HOST` | none | High Quay, as `host[:port]` |
 | Optional | `MIRROR_PLATFORM` | all platforms | One platform to mirror and transfer, e.g. `linux/amd64` |
-| Optional | `MIRROR_LEDGER` | `true` in CI | Keep the sender ledger in the project's generic package registry instead of `sent.json` |
+| Optional | `MIRROR_LEDGER` | `true` in CI | Keep the sender ledger (low side) or import receipt (high side) in the project's generic package registry instead of a local file |
 | Optional | `GITLAB_API_URL`, `PACKAGE_PROJECT`, `PACKAGE_TOKEN` | the CI job's API, project and job token | Package registry for the ledger and for `import --registry` outside CI |
-| Optional | `MIRROR_STATE_DIR` | `~/.local/state/quay-mirror` | Work directory and, without the ledger, `sent.json`; one writer per directory |
-| Optional | `MIRROR_BUNDLE_DIR` | `$MIRROR_STATE_DIR/bundles` | Where `sync` writes bundles for pickup |
-| Optional | `IMPORT_STATE_DIR` | `~/.local/state/quay-mirror-import` | Receipt ledger and replay guard |
+| Optional | `MIRROR_STATE_DIR` | `~/.local/state/quay-mirror`; the job directory in CI | Work directory and, without the ledger, `sent.json`; one writer per directory |
+| Optional | `MIRROR_BUNDLE_DIR` | `$MIRROR_STATE_DIR/bundles` | Where `sync` writes bundles; a bundle NiFi accepted is deleted |
+| Optional | `IMPORT_STATE_DIR` | `~/.local/state/quay-mirror-import`; the job directory in CI | Downloads and, without the ledger, `received.json` |
+| Optional | `MIRROR_SCAN` | `true` | `false` skips `sbom` and `scan`; `sync` then runs without them |
+| Optional | `MIRROR_JOB_TAG` | empty (untagged) | Runner tag for `verify`, `sbom` and `scan`, for example `shell` |
 | In high CI | `IMPORT_INBOX_DIR` | none | Directory holding transferred archive/checksum pairs |
 | Optional | `MIRROR_FULL` | `false` | Set `true` on Run pipeline to resend every approved image |
 | Optional | `EXPORT_SINCE`, `EXPORT_SEQUENCE`, `EXPORT_IMAGE` | none | On Run pipeline, resend instead of sync: `YYYY-MM-DD`, `N`, `N..` or `N..M`, `org/repo[:tag]` |
@@ -76,7 +78,8 @@ python3 mirror.py sync
 - Protect the default branch and mirror runner. Merge-request verification uses no mirror credentials or persistent state.
 - Enable Renovate on the GitLab copy. It proposes tag and digest updates to `images.txt` as merge requests; a person approves each one, and `scan` must pass first. Turn on **Pipelines must succeed** so a failed scan blocks the merge. `recreateWhen: always` reopens an update whenever `images.txt` still lacks it, even after its MR was closed or merged without the change (a conflict resolved in favour of the default branch); ignore an update with a `packageRules` entry, not by closing its MR. Let Renovate rebase a conflicted MR (the rebase checkbox, or its next run) rather than resolving the conflict by hand.
 - Create a nightly GitLab schedule against the protected default branch. Schedules mirror the reviewed catalog; they do not approve Renovate updates.
-- Keep the receipt state directory between runs: a shell runner's home directory does. On a container executor, point `IMPORT_STATE_DIR` at a persistent mount. Without the ledger, the same holds for `MIRROR_STATE_DIR`; use separate sender state for separate low registries.
+- In CI nothing persists on a runner: the ledger, receipt, SBOMs and bundles' contents live in the package and container registries, and each job's work directory is removed when it ends. Outside CI without `MIRROR_LEDGER`, keep `MIRROR_STATE_DIR` and `IMPORT_STATE_DIR` between runs, one per low or high registry.
+- On a shell executor, `sbom` and `scan` start `SYFT_IMAGE` and `GRYPE_IMAGE` with `podman run`, so the runner user must be able to pull them (`podman login`, or public images). Grype's database goes in the job directory and needs about 2 GB free there while `scan` runs.
 - For `import --registry`, give the uploader a project access token on the high project (Developer, scope `api`) and let Developers merge to the default branch: GitLab runs a pipeline on a protected branch only for a role that may merge to it.
 - Let the `scan` runner reach Grype's vulnerability database (`grype.anchore.io`), or point `GRYPE_DB_UPDATE_URL` at a mirror of it.
 - Provision registry trust through the host's containers certificate configuration; keep TLS verification enabled outside disposable labs.
@@ -85,7 +88,7 @@ python3 mirror.py sync
 
 Default-branch catalog/script/pipeline changes, schedules and Run pipeline run sync after verification.
 Every sync verifies each tagged low-side copy, version tags included, restores any that is missing and copies new or changed approved digests; unchanged entries need no upstream pull.
-The ledger records the digest and version tags last sent for each destination tag, and only entries where either changed enter a bundle. With `MIRROR_LEDGER=true` it is generic package `quay-mirror-ledger`: `head/state.json`, plus `<sequence>/images.json` for every bundle with its creation time, so any runner can take the next run. Keep one writer at a time: in CI, `sync` and `export` share `resource_group: quay-mirror`; do not run either by hand against the same ledger meanwhile. A daily run with no change prints `nothing to send` and writes no bundle. Sync never reads or deletes the bundle directory; the pickup removes bundles.
+The ledger records the digest and version tags last sent for each destination tag, and only entries where either changed enter a bundle. With `MIRROR_LEDGER=true` it is generic package `quay-mirror-ledger`: `head/state.json`, plus `<sequence>/images.json` for every bundle with its creation time, so any runner can take the next run. Keep one writer at a time: in CI, `sync` and `export` share `resource_group: quay-mirror`; do not run either by hand against the same ledger meanwhile. A daily run with no change prints `nothing to send` and writes no bundle. A bundle that `NIFI_URL` accepted is deleted at once; without `NIFI_URL` it stays in `MIRROR_BUNDLE_DIR` for pickup. `docs/ledger.md` walks through the ledger, sequences, resends and the receipt.
 `mirror.py pending` lists what the next sync sends: catalog entries the ledger has not sent at their current digest and platform. `sbom` writes a CycloneDX SBOM of each with Syft (`MIRROR_PLATFORM`, else `linux/amd64`), `scan` checks it with Grype (`--only-fixed`), and `sync` waits for `scan`. After a sync, each SBOM and Grype report is kept as generic package `quay-mirror-sbom`, version the image digest (`sha256-<hex>`). Charts hold no packages and have neither.
 `-v` (or `MIRROR_VERBOSE=true`) prints every skopeo and curl command and each unchanged entry; normal output prints one `send:` line per bundled image.
 With `MIRROR_PLATFORM` set, low Quay, the archive and high Quay hold only that platform's image: its digest is the one the index lists for that platform, not the index digest in `images.txt`. Where the index names no platforms, each child image's config decides. A signature, attestation or nested index is never selected, whatever platform it names. An image or index with no image for that platform fails sync before any copy. Changing it resends every image.

@@ -13,6 +13,10 @@ variables:
   SYFT_IMAGE: 'docker.io/anchore/syft:v1.54.0-debug'
   GRYPE_IMAGE: 'docker.io/anchore/grype:v0.120.0-debug'
   GRYPE_FAIL_ON: 'critical'
+  # false skips sbom and scan, and sync no longer waits for them.
+  MIRROR_SCAN: 'true'
+  # Runner tag for verify, sbom and scan; empty sends them to any runner that takes untagged jobs.
+  MIRROR_JOB_TAG: ''
   MIRROR_FULL: 'false'
   # Run pipeline with one of these set runs export instead of sync: YYYY-MM-DD, N / N.. / N..M, org/repo[:tag].
   EXPORT_SINCE: ''
@@ -22,6 +26,7 @@ variables:
 verify:
   stage: verify
   image: $PYTHON_IMAGE
+  tags: [$MIRROR_JOB_TAG]
   dependencies: []
   script:
     - python3 mirror.py targets
@@ -35,7 +40,22 @@ verify:
 
 .gate: &gate
   stage: verify
+  tags: [$MIRROR_JOB_TAG]
+  # A docker executor runs the job in the scanner's image; a shell executor has only podman, so
+  # run_image starts the same image through it. Grype's database goes in the job directory.
+  before_script:
+    - |
+      run_image() {
+        image=$1; binary=$2; shift 2
+        if [ -x "$binary" ]; then "$binary" "$@"
+        else podman run --rm --user 0 -v "$PWD:$PWD:z" -w "$PWD" -e GRYPE_DB_CACHE_DIR="$PWD/.grype-db" \
+          --entrypoint "$binary" "$image" "$@"; fi
+      }
+  after_script:
+    - rm -rf .grype-db
   rules:
+    - if: '$MIRROR_SCAN == "false"'
+      when: never
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - images.txt
@@ -58,7 +78,7 @@ sbom:
         name="${source%@*}"; digest="${source#*@}"; reference="${name%:*}@$digest"
         file="sbom/$(echo "$digest" | tr : -).cdx.json"
         echo "sbom: $source"
-        if ! /syft scan "registry:$reference" --platform "${MIRROR_PLATFORM:-linux/amd64}" \
+        if ! run_image "$SYFT_IMAGE" /syft scan "registry:$reference" --platform "${MIRROR_PLATFORM:-linux/amd64}" \
             -o "cyclonedx-json=$file" 2> syft.err; then
           rm -f "$file"
           if grep -q 'application/vnd.cncf.helm' syft.err; then
@@ -88,7 +108,7 @@ scan:
       for file in sbom/*.cdx.json; do
         [ -e "$file" ] || continue
         echo "grype: $file"
-        /grype "sbom:$file" --only-fixed --fail-on "$GRYPE_FAIL_ON" -o table \
+        run_image "$GRYPE_IMAGE" /grype "sbom:$file" --only-fixed --fail-on "$GRYPE_FAIL_ON" -o table \
           -o "json=${file%.cdx.json}.grype.json" || failed=1
       done
       exit "$failed"
@@ -97,8 +117,8 @@ scan:
     paths: [sbom/]
     expire_in: 1 week
 
-# A protected shell runner. The ledger keeps sender state in this project's package registry.
-# Merge-request validation runs elsewhere, without registry credentials or state.
+# A protected shell runner with skopeo. Bundles go to NiFi and are deleted once it accepts them.
+# Merge-request validation runs elsewhere, without registry credentials.
 sync: &mirror
   stage: publish
   environment:
@@ -111,9 +131,12 @@ sync: &mirror
       artifacts: false
     - job: scan
       artifacts: true
+      optional: true  # absent with MIRROR_SCAN=false
   variables:
-    # sent.json lives in this project's package registry, so any mirror runner can take the next run.
+    # Sender state lives in this project's package registry, and the work directory in the job's own
+    # checkout, removed afterwards: nothing persists on the runner.
     MIRROR_LEDGER: 'true'
+    MIRROR_STATE_DIR: '$CI_PROJECT_DIR/.mirror-work'
     # A CI job has no XDG_RUNTIME_DIR, so skopeo's default auth file is not writable.
     REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
   script:
@@ -138,7 +161,7 @@ sync: &mirror
         echo "kept: quay-mirror-sbom/$version/$base"
       done
   after_script:
-    - rm -f "$CI_PROJECT_DIR/.registry-auth.json"
+    - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/.mirror-work"
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never

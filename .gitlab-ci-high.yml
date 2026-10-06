@@ -29,6 +29,9 @@ import:
     - job: verify
       artifacts: false
   variables:
+    # The receipt lives in this project's package registry and the downloads in the job directory.
+    MIRROR_LEDGER: 'true'
+    IMPORT_STATE_DIR: '$CI_PROJECT_DIR/.import-work'
     REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
   script:
     - printf '%s' "$HIGH_QUAY_PASSWORD" | skopeo login --tls-verify="${HIGH_QUAY_TLS_VERIFY:-true}" --username "$HIGH_QUAY_USERNAME" --password-stdin "$HIGH_QUAY_HOST"
@@ -39,4 +42,4 @@ import:
         python3 mirror.py import --registry ${BUNDLE:+--name "$BUNDLE"}
       fi
   after_script:
-    - rm -f "$CI_PROJECT_DIR/.registry-auth.json"
+    - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/.import-work"
