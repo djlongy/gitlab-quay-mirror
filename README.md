@@ -20,19 +20,19 @@ Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` 
 | Required | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account that can push; leave unset for a registry without auth |
 | Required | `NIFI_URL` | none | NiFi ListenHTTP the bundles are posted to |
 | Optional | `TARGET_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
-| Optional | `SOURCE_REGISTRY`, `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD`, `SOURCE_REGISTRY_TLS_VERIFY` | `docker.io`, none | Pull login, for example against Docker Hub rate limits |
+| Optional | `SOURCE_REGISTRY`, `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD`, `SOURCE_REGISTRY_TLS_VERIFY` | none | Login and TLS setting for one source registry, for example `docker.io` against rate limits; other source hosts pull anonymously with TLS verified |
 | Optional | `MIRROR_PLATFORM` | all platforms | One platform, for example `linux/amd64` |
 | Optional | `MIRROR_SCAN`, `GRYPE_FAIL_ON` | `true`, `critical` | Syft SBOM and Grype gate before `sync`; `false` skips both |
-| Optional | `SYFT_IMAGE`, `GRYPE_IMAGE` | `anchore/syft:v1.54.0-debug`, `anchore/grype:v0.120.0-debug` | Scanner images |
+| Optional | `SYFT_IMAGE`, `GRYPE_IMAGE` | `docker.io/anchore/syft:v1.54.0-debug`, `docker.io/anchore/grype:v0.120.0-debug` | Scanner images |
 | Optional | `MIRROR_BUNDLE_DIR` | none | Keep bundles in a directory for hand-carry instead of NiFi |
 | Run pipeline | `RESEND_ALL`, `RESEND_SEQUENCE`, `RESEND_SINCE`, `RESEND_IMAGE` | none | Recovery, see [Resend](#resend) |
 
 Add each image by the tag you run; `add` pins its current digest in `images.txt`:
 
 ```sh
-python3 mirror.py add prom/prometheus:v3.13.4 team/prometheus
-python3 mirror.py add bitnami/redis:latest team/redis            # also tagged with the version it reports
-python3 mirror.py add bitnamicharts/redis:22.0.7 charts/redis    # an OCI Helm chart
+python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus
+python3 mirror.py add docker.io/bitnami/redis:latest team/redis            # also tagged with the version it reports
+python3 mirror.py add docker.io/bitnamicharts/redis:22.0.7 charts/redis    # an OCI Helm chart
 python3 mirror.py add registry.low.example.com/team/runner:1.2 team/runner   # your own image, already in TARGET_REGISTRY
 ```
 
