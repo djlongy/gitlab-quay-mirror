@@ -1,4 +1,4 @@
-# Build the quay high-side flow by hand
+# Build the high-side NiFi flow by hand
 
 The high half of `nifi/flow.py --side high`, for a NiFi where you cannot run scripts.
 Anything not listed stays at its default. Written for the NiFi 2.x UI. Property names,
@@ -22,7 +22,7 @@ the digest the low side approved. `skopeo copy --preserve-digests` keeps it, and
 ## Before you start
 
 - The high registry. A plain `registry:2` works: `import` only pushes and inspects over
-  the registry API, and it never calls a Quay API.
+  the registry API, so Quay, Harbor, GitLab, Artifactory and Nexus work the same.
 - A high GitLab project holding this repository, with **Settings > CI/CD > General
   pipelines > CI/CD configuration file** set to `.gitlab-ci-high.yml`.
 - A runner that takes untagged jobs (or the one `MIRROR_JOB_TAG` names) with `python3` (3.9 or later), `skopeo`
@@ -31,9 +31,9 @@ the digest the low side approved. `skopeo copy --preserve-digests` keeps it, and
 
   | Variable | Value |
   |---|---|
-  | `HIGH_QUAY_HOST` | the registry as `host[:port]` |
-  | `HIGH_QUAY_USERNAME`, `HIGH_QUAY_PASSWORD` | an account that can push. A `registry:2` without auth accepts any value |
-  | `HIGH_QUAY_TLS_VERIFY` | `false` only for a plain-HTTP registry |
+  | `TARGET_REGISTRY` | the registry as `host[:port]` |
+  | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | an account that can push. Leave unset for a registry without auth |
+  | `TARGET_REGISTRY_TLS_VERIFY` | `false` only for a plain-HTTP registry |
 
 - A project access token for NiFi: role **Developer**, scope **api**.
 - **Settings > Repository > Protected branches**: allow **Developers + Maintainers** to
@@ -47,7 +47,7 @@ The low side POSTs two files per bundle to NiFi, each with these attributes:
 
 | Attribute | Value |
 |---|---|
-| `filename` | `quay-<stream>-<sequence>.tar` or the same name plus `.sha256` |
+| `filename` | `mirror-<stream>-<sequence>.tar` or the same name plus `.sha256` |
 | `X-Sha256` | SHA-256 of this file |
 | `X-Artifact-Type` | `container-images` |
 | `X-Artifact-Format` | `tar` or `sha256` |
@@ -65,7 +65,7 @@ package version.
 ## Part 1: parameter context
 
 1. Top-right menu (**☰**) > **Parameter Contexts** > **+**.
-2. **Settings** tab: Name `quay-to-gitlab`.
+2. **Settings** tab: Name `registry-mirror-high`.
 3. **Parameters** tab, add four parameters with **+**. Choose **Sensitive: Yes** for
    `gitlab.token` when you create it: it cannot be changed afterwards.
 
@@ -80,10 +80,10 @@ package version.
 
 ## Part 2: process group
 
-1. Drag the **Process Group** icon onto the canvas, name it `quay-to-gitlab`, click
+1. Drag the **Process Group** icon onto the canvas, name it `registry-mirror-high`, click
    **Add**.
 2. Right-click it > **Configure** > **Settings**: set **Parameter Context** to
-   `quay-to-gitlab`, click **Apply**.
+   `registry-mirror-high`, click **Apply**.
 3. Double-click the group to go inside it. Add an **Input Port** named `in` if the
    bundles come from your shared feed router, and connect your router's
    container-images output to it.
@@ -103,7 +103,7 @@ Type **RouteOnAttribute**.
 | Property | Value |
 |---|---|
 | Routing Strategy | `Route to Property name` (default) |
-| `container-images` *(add)* | `${X-Artifact-Type:equals('container-images'):and(${X-Artifact-Action:equals('mirror')}):and(${filename:matches('quay-[0-9a-f]{32}-[0-9]{12}[.]tar([.]sha256)?')})}` |
+| `container-images` *(add)* | `${X-Artifact-Type:equals('container-images'):and(${X-Artifact-Action:equals('mirror')}):and(${filename:matches('mirror-[0-9a-f]{32}-[0-9]{12}[.]tar([.]sha256)?')})}` |
 
 Auto-terminate: `unmatched`, or wire it to your other feeds.
 
@@ -134,7 +134,7 @@ Type **InvokeHTTP**.
 | Property | Value |
 |---|---|
 | HTTP Method | `PUT` |
-| HTTP URL | `#{gitlab.api}/projects/#{gitlab.project}/packages/generic/quay-bundles/${filename:substringBefore('.tar')}/${filename}` |
+| HTTP URL | `#{gitlab.api}/projects/#{gitlab.project}/packages/generic/registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}` |
 | Request Body Enabled | `true` |
 | Response Body Attribute Name | `gitlab.response` |
 | `PRIVATE-TOKEN` *(add, sensitive)* | `#{gitlab.token}` |
@@ -168,7 +168,7 @@ Then the processor. Type **PutS3Object**.
 | Property | Value |
 |---|---|
 | Bucket | the bucket name |
-| Object Key | `quay-bundles/${filename:substringBefore('.tar')}/${filename}`, with the project's `S3_PREFIX` and a `/` in front when it sets one |
+| Object Key | `registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}`, with the project's `S3_PREFIX` and a `/` in front when it sets one |
 | Region | `us-east-1`, or the store's region |
 | AWS Credentials Provider Service | `S3 credentials` |
 | SSL Context Service | `S3 CA` |
@@ -178,8 +178,8 @@ Then the processor. Type **PutS3Object**.
 Auto-terminate: none. In Part 4, connect `success` to **Start the import pipeline** and
 `failure` to **Rejected (inspect queue)**, in place of rows 7 to 9.
 
-Give the bucket a lifecycle rule that expires `quay-bundles/` after a few days, or set
-`IMPORT_DELETE_BUNDLES=true` on the high project. Never expire `quay-import-receipt/`.
+Give the bucket a lifecycle rule that expires `registry-mirror-bundles/` after a few days, or set
+`IMPORT_DELETE_BUNDLES=true` on the high project. Never expire `registry-mirror-receipt/`.
 
 ### 5. Start the import pipeline
 
@@ -238,9 +238,9 @@ arrow away and back onto the same processor.
    A mistyped built-in property also shows as a deletable row.
 3. Select everything except **Rejected (inspect queue)**, right-click > **Start**.
 4. On the low side, run the low project's pipeline. Its `sync` log names what it sent:
-   `posted to NiFi: quay-<stream>-<n>.tar -> <url> (HTTP 200, ...)`.
+   `posted to NiFi: mirror-<stream>-<n>.tar -> <url> (HTTP 200, ...)`.
 5. Watch the queues. Two flowfiles reach **Delivered**, nothing reaches **Rejected**.
-6. In the high project, **Deploy > Package registry** shows `quay-bundles` with that
+6. In the high project, **Deploy > Package registry** shows `registry-mirror-bundles` with that
    version, and **Build > Pipelines** shows two pipelines. The `import` log names each
    image as `pushed to high registry: <host>/<repo>:<tag>@sha256:...`.
 7. Pull that exact path to prove it: `podman pull <host>/<repo>:<tag>@sha256:...`
@@ -251,7 +251,7 @@ and open the flowfile's attributes:
   token, 404 the project ID or `gitlab.api`, 400 with "insufficient permission to run a
   pipeline" means Developers may not merge to `gitlab.ref`.
 - A file rejected at **File matches X-Sha256** was damaged in transit. On the low side,
-  run the pipeline with `EXPORT_SEQUENCE=<n>..`.
+  run the pipeline with `RESEND_SEQUENCE=<n>..`.
 
 ## Without a pipeline
 
