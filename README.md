@@ -2,7 +2,7 @@
 
 Mirrors reviewed container images and Helm charts into a registry on a connected low side, then carries them in verified bundles across a one-way link into a registry on an isolated high side. Any OCI registry works on either side: Quay, Harbor, GitLab, Artifactory, Nexus or `registry:2`. [Quickstart](QUICKSTART.md).
 
-Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` (`sync`), bundle to `NIFI_URL`, across the link, NiFi files it in `IMPORT_STORE`, then `import` pushes it to the high `TARGET_REGISTRY`. Each project sets `TARGET_REGISTRY` to its own side's registry.
+Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` (`sync`), bundle to `NIFI_URL`, across the link, NiFi files it in `IMPORT_STORE`, then `import` pushes it to the high `TARGET_REGISTRY`. Each project sets `TARGET_REGISTRY` to its own side's registry. `docs/dataflow.md` walks through every step.
 
 ## Requirements
 
@@ -88,7 +88,7 @@ The high side cannot ask for a bundle over a one-way link, so a lost one is rese
 ## Behaviour
 
 - Nothing persists on a runner. The ledger (`registry-mirror-ledger`), SBOMs (`registry-mirror-sbom`) and receipt (`registry-mirror-receipt`) live in the package registry or the bucket; images live in the registries.
-- A bundle is recorded as sent only once NiFi accepted it or it was written to `MIRROR_BUNDLE_DIR`. With neither, `sync` updates the low registry and prints `not sent to the high side`.
+- A bundle is recorded as sent only once NiFi accepts it or it is written to `MIRROR_BUNDLE_DIR`. With neither, `sync` updates the low registry and prints `not sent to the high side`.
 - `sync` and `resend` run only where `TARGET_REGISTRY` is set, so the source project runs the tests and scan only.
 - Import refuses a replayed older bundle and a gap in the sequence, and reports a duplicate trigger as `already imported`.
 

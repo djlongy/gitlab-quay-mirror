@@ -250,7 +250,7 @@ and open the flowfile's attributes:
 - `invokehttp.status.code` and `gitlab.response` explain a GitLab refusal: 401 means the
   token, 404 the project ID or `gitlab.api`, 400 with "insufficient permission to run a
   pipeline" means Developers may not merge to `gitlab.ref`.
-- A file rejected at **File matches X-Sha256** was damaged in transit. On the low side,
+- A file rejected at **File matches X-Sha256** arrives damaged. On the low side,
   run the pipeline with `RESEND_SEQUENCE=<n>..`.
 
 ## Without a pipeline
