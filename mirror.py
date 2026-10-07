@@ -25,7 +25,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TAG = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
 DIGEST = r"sha256:[0-9a-f]{64}"
-SOURCE = re.compile(rf"(?P<host>[a-z0-9.-]+(?::[0-9]+)?)/(?P<repo>[a-z0-9._/-]+):(?P<tag>{TAG})")
+HOST = r"(?:localhost|[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::[0-9]+)?|[a-z0-9-]+:[0-9]+"  # a dot, a port or localhost
+SOURCE = re.compile(rf"(?P<host>{HOST})/(?P<repo>[a-z0-9._/-]+):(?P<tag>{TAG})")
 TARGET = re.compile(r"[a-z0-9][a-z0-9_-]*(?:/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)+")
 IMAGE_CONFIGS = ("application/vnd.oci.image.config.v1+json", "application/vnd.docker.container.image.v1+json")
 IMAGE_LAYER = re.compile(r"application/vnd\.oci\.image\.layer\.(?:nondistributable\.)?v1\.tar(?:\+gzip|\+zstd)?"
@@ -137,7 +138,7 @@ def run(*args):
 # Credentials come from skopeo's default auth file, written by `skopeo login` or
 # `podman login`. REGISTRY_AUTH_FILE moves it for both the login and this script.
 def options(side, direction=""):
-    return [f"--{direction}tls-verify=false"] if os.environ.get(f"{side}_TLS_VERIFY") == "false" else []
+    return [f"--{direction}tls-verify=false"] if side and os.environ.get(f"{side}_TLS_VERIFY") == "false" else []
 
 
 def raw_digest(reference, side):
@@ -147,10 +148,13 @@ def raw_digest(reference, side):
 
 
 def side_of(reference):
-    """Which registry's settings read a catalog source: TARGET_REGISTRY when the image already
-    lives there (your own build in the low registry), else SOURCE_REGISTRY."""
+    """Which registry's settings read a catalog source: TARGET_REGISTRY or SOURCE_REGISTRY when
+    its host is that registry, else None (defaults: TLS verified, no login)."""
     host = reference.split("://", 1)[-1].split("/", 1)[0]
-    return "TARGET_REGISTRY" if host and host == os.environ.get("TARGET_REGISTRY", "").strip().rstrip("/") else "SOURCE_REGISTRY"
+    for side in ("TARGET_REGISTRY", "SOURCE_REGISTRY"):
+        if host and host == os.environ.get(side, "").strip().rstrip("/"):
+            return side
+    return None
 
 
 def fetch_manifest(reference, side=None):
@@ -370,7 +374,9 @@ def ledger_records(last):
 
 
 def normalise(source):
-    """Expand a short name the way docker pull does: alpine:3 is docker.io/library/alpine:3."""
+    """Expand a short name the way docker pull does: alpine:3 is docker.io/library/alpine:3.
+    Only for references mirror.py reads elsewhere (FROM lines) and for the hint in add; the
+    catalog holds every source in full."""
     first, _, rest = source.partition("/")
     if not rest or not ("." in first or ":" in first or first == "localhost"):
         source = "docker.io/" + source
@@ -425,10 +431,11 @@ def image_child(child, fetch, depth):
 
 
 def add_image(path, source, target):
-    source = normalise(source)
     name = source.split("@", 1)[0]
+    if not re.match(rf"(?:{HOST})/", name):
+        raise MirrorError(f"{source} has no registry host; give the full reference, for example {normalise(source)}")
     if not SOURCE.fullmatch(name) or not TARGET.fullmatch(target):
-        raise MirrorError("add needs [registry/]repo:tag and org/repo[/path]")
+        raise MirrorError("add needs registry/repo:tag and org/repo[/path]")
     raw = run("skopeo", "inspect", "--raw", *options(side_of(source)), "docker://" + transport_reference(source))
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if not runnable(json.loads(raw), lambda child: fetch_manifest(f"docker://{name.rsplit(':', 1)[0]}@{child}")):
@@ -1070,11 +1077,11 @@ def login():
 
     A registry without authentication needs no login: leave its USERNAME unset.
     """
-    for side, default in (("TARGET_REGISTRY", None), ("SOURCE_REGISTRY", "docker.io")):
-        host = registry(side) if default is None else (os.environ.get(side) or default)
+    for side in ("TARGET_REGISTRY", "SOURCE_REGISTRY"):
         user = os.environ.get(f"{side}_USERNAME")
         if not user:
             continue
+        host = registry(side)
         tls = "false" if os.environ.get(f"{side}_TLS_VERIFY") == "false" else "true"
         result = subprocess.run(["skopeo", "login", f"--tls-verify={tls}", "--username", user, "--password-stdin", host],
                                 input=os.environ.get(f"{side}_PASSWORD", "").encode(), capture_output=True, check=False)
@@ -1086,7 +1093,7 @@ def login():
 EXAMPLES = """
 Low side (pull from the source, save to your registry, send bundles):
   TARGET_REGISTRY=registry.low.example.com mirror.py login
-  mirror.py add prom/prometheus:v3.13.4 team/prometheus
+  mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus
   mirror.py sync                      # NIFI_URL set: bundle posted to NiFi
   mirror.py resend --sequence 7..     # the high side reported bundle 7 missing
 
@@ -1114,13 +1121,13 @@ def main(argv=None):
     command("login", "log in to TARGET_REGISTRY, and SOURCE_REGISTRY when it has credentials",
             "  TARGET_REGISTRY=registry.example.com TARGET_REGISTRY_USERNAME=robot \\\n"
             "    TARGET_REGISTRY_PASSWORD=... mirror.py login\n"
-            "  SOURCE_REGISTRY_USERNAME=me SOURCE_REGISTRY_PASSWORD=... mirror.py login   # docker.io pulls")
+            "  SOURCE_REGISTRY=docker.io SOURCE_REGISTRY_USERNAME=me SOURCE_REGISTRY_PASSWORD=... mirror.py login")
     command("targets", "validate and list the image catalog", "  mirror.py targets")
     add = command("add", "resolve a tag to its digest and append a catalog entry",
-                  "  mirror.py add prom/prometheus:v3.13.4 team/prometheus\n"
+                  "  mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus\n"
                   "  mirror.py add quay.io/prometheus/node-exporter:v1.9.1 team/node-exporter\n"
-                  "  mirror.py add bitnamicharts/redis:22.0.7 charts/redis   # an OCI Helm chart")
-    add.add_argument("source", help="[registry/]repository:tag, as for docker pull")
+                  "  mirror.py add docker.io/bitnamicharts/redis:22.0.7 charts/redis   # an OCI Helm chart")
+    add.add_argument("source", help="registry/repository:tag in full, e.g. docker.io/library/alpine:3.20")
     add.add_argument("target", help="repository path in TARGET_REGISTRY, any depth, e.g. team/prometheus")
     sync_command = command("sync", "mirror the catalog into TARGET_REGISTRY and send what changed",
                            "  mirror.py sync          # send changed images; NIFI_URL or MIRROR_BUNDLE_DIR receives\n"

@@ -99,10 +99,17 @@ class MirrorTest(unittest.TestCase):
              'platform': {'os': 'linux', 'architecture': 'amd64'}}]}).encode()
         pinned = 'sha256:' + hashlib.sha256(index).hexdigest()
         with mock.patch.object(mirror, 'run', side_effect=[index, image]) as lookup:
-            mirror.add_image(path, 'prom/prometheus:v3.13.4', 'team-dev/prom/prometheus')
+            mirror.add_image(path, 'docker.io/prom/prometheus:v3.13.4', 'team-dev/prom/prometheus')
         self.assertEqual(lookup.call_args_list[0].args[-1], 'docker://docker.io/prom/prometheus:v3.13.4')
         self.assertEqual(path.read_text(), f'docker.io/prom/prometheus:v3.13.4@{pinned} team-dev/prom/prometheus\n')
         self.assertEqual(mirror.normalise('alpine:3.20'), 'docker.io/library/alpine:3.20')
+        for short, full in [('prom/prometheus:v3.13.4', 'docker.io/prom/prometheus:v3.13.4'),
+                            ('alpine:3.20', 'docker.io/library/alpine:3.20')]:
+            with self.assertRaisesRegex(mirror.MirrorError, f'no registry host; give the full reference, for example {full}'):
+                mirror.add_image(path, short, 'team-dev/prom/prometheus')
+            with self.assertRaises(mirror.MirrorError):
+                mirror.parse_image(short + '@sha256:' + 'a'*64, 'team-dev/prom/prometheus')
+        self.assertEqual(mirror.parse_image('registry:5000/a/b:1@sha256:' + 'a'*64, 'team/b')['tag'], '1')
         self.assertEqual(mirror.normalise('quay.io/org/image:1'), 'quay.io/org/image:1')
         self.assertEqual(mirror.normalise('localhost:5000/image:1'), 'localhost:5000/image:1')
 
@@ -128,7 +135,7 @@ class MirrorTest(unittest.TestCase):
                 self.assertFalse(mirror.runnable(artifact))
                 with mock.patch.object(mirror, 'run', return_value=json.dumps(artifact).encode()), \
                         self.assertRaisesRegex(mirror.MirrorError, 'not a container image'):
-                    mirror.add_image(self.root / 'images.txt', 'bitnami/redis:sha256-' + 'c'*64 + '.sig',
+                    mirror.add_image(self.root / 'images.txt', 'docker.io/bitnami/redis:sha256-' + 'c'*64 + '.sig',
                                      'mirror/bitnami/redis')
         self.assertFalse((self.root / 'images.txt').exists())
 
@@ -945,10 +952,14 @@ class LedgerTest(unittest.TestCase):
     def test_a_source_in_the_target_registry_reads_with_the_target_settings(self):
         self.assertEqual(mirror.side_of('low.example.internal/team/runner:1.2@sha256:' + 'a'*64), 'TARGET_REGISTRY')
         self.assertEqual(mirror.side_of('docker://low.example.internal/team/runner@sha256:' + 'a'*64), 'TARGET_REGISTRY')
-        self.assertEqual(mirror.side_of('docker.io/library/alpine:3.20'), 'SOURCE_REGISTRY')
+        self.assertEqual(mirror.side_of('docker.io/library/alpine:3.20'), None)
         os.environ['TARGET_REGISTRY_TLS_VERIFY'] = 'false'
         self.assertEqual(mirror.options(mirror.side_of('low.example.internal/team/runner:1.2')), ['--tls-verify=false'])
         self.assertEqual(mirror.options(mirror.side_of('docker.io/library/alpine:3.20')), [])
+        os.environ.update({'SOURCE_REGISTRY': 'mirror.example.internal:5000', 'SOURCE_REGISTRY_TLS_VERIFY': 'false'})
+        self.assertEqual(mirror.options(mirror.side_of('mirror.example.internal:5000/a/b:1')), ['--tls-verify=false'])
+        self.assertIsNone(mirror.side_of('quay.io/org/image:1'))
+        self.assertEqual(mirror.options(mirror.side_of('quay.io/org/image:1')), [])  # TLS stays on for other hosts
 
     def test_login_without_a_username_logs_in_nowhere(self):
         with mock.patch.object(mirror.subprocess, 'run') as ran:
