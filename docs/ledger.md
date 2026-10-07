@@ -13,7 +13,7 @@ the inputs and commands.
 | Bundle | One tar file plus its `.sha256` checksum. It carries `images.json` (what is inside) and a `dir:` copy of each image: every manifest, config and layer, byte for byte. |
 | Stream | A random id chosen once by the sender. Every bundle from that sender carries it, so the high side can tell one sender's history from another's. |
 | Sequence | The bundle's number within the stream: 1, 2, 3 and so on, with no reuse. |
-| Ledger | The sender's record: what each destination tag was last sent as, and every bundle ever written. |
+| Ledger | The sender's record: the last digest sent for each destination tag, and every bundle written. |
 | Receipt | The high side's record: the last bundle it imported. |
 
 ## Where the state lives
@@ -71,7 +71,7 @@ new store first, then switch `IMPORT_STORE` and the NiFi upload processor.
    crash cannot reuse the number.
 5. Copies each changed image out of the low registry into the bundle, checks every file against its
    digest, and writes `images.json` and the `.sha256`.
-6. Uploads `<sequence>/images.json` to the ledger with the time it was created.
+6. Uploads `<sequence>/images.json` to the ledger with its creation time.
 7. POSTs the checksum, then the bundle, to `NIFI_URL`, and deletes both once NiFi accepts them.
 8. Updates `sent`, `aliases` and `pending: false` in the ledger.
 
@@ -111,8 +111,8 @@ A resend gets a new sequence number, because the high side refuses a second bund
 old number and different content. When it covers every bundle from N to the newest, it
 carries `"from": N`. The high side then accepts it over a gap that starts at N.
 
-Worked example: the high side imported bundle 6, then bundles 7 and 8 were lost in
-transit, and bundle 9 arrives.
+Worked example: the high side holds bundle 6, bundles 7 and 8 are lost in transit, and
+bundle 9 arrives.
 
 1. Import refuses 9: `missing earlier bundle 7 to 8 (imported up to 6, received 9); on the low side, Run pipeline with RESEND_SEQUENCE=7..`.
 2. On the low side, Run pipeline with `RESEND_SEQUENCE=7..`. Resend writes bundle 10,
@@ -140,7 +140,7 @@ action, `Run pipeline with RESEND_SEQUENCE=N..`.
 | A run died after reserving a sequence | `pending: true` in the ledger | nothing: the next sync is full and bridges it |
 | NiFi refused the POST | sync fails; the ledger records the bundle | rerun the pipeline (the next sync is full), or `RESEND_SEQUENCE=N` |
 | The high side lost its receipt | `--registry` replays the stream from bundle 1 out of `registry-mirror-bundles` (pushes are idempotent, later bundles win); with deleted or expired bundles, and with `--inbox`, it refuses all but a full bundle | with every bundle kept, nothing; otherwise Run pipeline on the low side with `RESEND_ALL=true` |
-| The ledger was deleted | sync starts a new stream | import its first bundle with `--adopt-stream` after review |
+| The ledger is deleted | sync starts a new stream | import its first bundle with `--adopt-stream` after review |
 | The source deleted an old digest | a resend of that image fails | update the catalog; the low registry still holds every image it ever received |
 
 ## The scan
@@ -160,8 +160,8 @@ receipt while a pipeline might.
 
 ## Upgrading from the Quay-named version
 
-The rename was a hard cutover. A project that ran the earlier version keeps its old state
-under the old names, and the new version does not read it:
+A project on the Quay-named version keeps its state under the old names, and this version
+does not read them:
 
 - Rename the CI variables; a job with an old name set fails and names the new one.
 - Both sides start over. The first `sync` finds no `registry-mirror-ledger` and sends a new
