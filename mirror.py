@@ -4,6 +4,7 @@
 import argparse
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -199,6 +200,16 @@ def package_request(method, package, version, name, data=None):
     return urllib.request.urlopen(request, timeout=600, context=context)
 
 
+def package_api(method, url, key, value):
+    say(f"+ {method} {url}")
+    context = ssl.create_default_context()
+    for bundle in {os.environ.get("CA_BUNDLE"), os.environ.get("CI_SERVER_TLS_CA_FILE")} - {None, ""}:
+        context.load_verify_locations(cafile=bundle)
+    request = urllib.request.Request(url, method=method, headers={key: value})
+    with urllib.request.urlopen(request, timeout=600, context=context) as response:
+        return response.read()
+
+
 def package_get(package, version, name, destination=None):
     """A generic package file's bytes, or written to destination; None when GitLab has none."""
     try:
@@ -240,10 +251,96 @@ def save_state(state_file, state, remote=True):
         package_put(LEDGER, "head", "state.json", state_file.read_bytes())
 
 
+def s3_enabled():
+    return os.environ.get("IMPORT_STORE", "gitlab") == "s3"
+
+
+def s3_request(method, key, data=None):
+    """One path-style request to an S3-compatible store, signed with AWS Signature Version 4."""
+    endpoint = os.environ.get("S3_ENDPOINT", "").rstrip("/")
+    bucket = os.environ.get("S3_BUCKET", "")
+    access, secret = os.environ.get("AWS_ACCESS_KEY_ID", ""), os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    if not (endpoint and bucket and access and secret):
+        raise MirrorError("IMPORT_STORE=s3 needs S3_ENDPOINT, S3_BUCKET, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+    region = os.environ.get("S3_REGION") or "us-east-1"
+    prefix = os.environ.get("S3_PREFIX", "").strip("/")
+    url = f"{endpoint}/{urllib.parse.quote(bucket)}/{urllib.parse.quote((prefix + '/' if prefix else '') + key)}"
+    parts = urllib.parse.urlsplit(url)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    headers = {"host": parts.netloc, "x-amz-content-sha256": "UNSIGNED-PAYLOAD", "x-amz-date": stamp}
+    signed = ";".join(sorted(headers))
+    canonical = "\n".join([method, parts.path, "", *(f"{name}:{headers[name]}" for name in sorted(headers)),
+                           "", signed, "UNSIGNED-PAYLOAD"])
+    scope = f"{stamp[:8]}/{region}/s3/aws4_request"
+    signing = ("AWS4" + secret).encode()
+    for part in (stamp[:8], region, "s3", "aws4_request"):
+        signing = hmac.new(signing, part.encode(), hashlib.sha256).digest()
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    headers["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={signed}, "
+                                f"Signature={hmac.new(signing, to_sign.encode(), hashlib.sha256).hexdigest()}")
+    del headers["host"]  # urllib sends the same value
+    context = ssl.create_default_context()
+    if os.environ.get("S3_TLS_VERIFY") == "false":
+        context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
+    elif os.environ.get("S3_CA_BUNDLE"):  # a self-signed or private CA, added to the system roots
+        context.load_verify_locations(cafile=os.environ["S3_CA_BUNDLE"])
+        # Python 3.13+ also demands RFC 5280 extensions an appliance's own CA often lacks (key usage);
+        # trust still comes only from this CA.
+        context.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+    say(f"+ {method} {url}")
+    return urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers=headers),
+                                  timeout=600, context=context)
+
+
+def store_get(package, version, name, destination=None):
+    """A high-side file from IMPORT_STORE: the bucket's <package>/<version>/<name>, or the generic package."""
+    if not s3_enabled():
+        return package_get(package, version, name, destination)
+    try:
+        with s3_request("GET", f"{package}/{version}/{name}") as response:
+            if destination is None:
+                return response.read()
+            with open(destination, "wb") as stream:
+                shutil.copyfileobj(response, stream)
+            return destination
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise MirrorError(f"S3 GET {package}/{version}/{name}: HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise MirrorError(f"S3 GET {package}/{version}/{name}: {error.reason}") from error
+
+
+def store_put(package, version, name, data):
+    if not s3_enabled():
+        return package_put(package, version, name, data)
+    try:
+        s3_request("PUT", f"{package}/{version}/{name}", data).close()
+    except urllib.error.URLError as error:
+        raise MirrorError(f"S3 PUT {package}/{version}/{name}: {getattr(error, 'code', error.reason)}") from error
+
+
+def store_delete(package, version, names):
+    """Remove an imported bundle: its objects in the bucket, or its generic package version."""
+    try:
+        if s3_enabled():
+            for name in names:
+                s3_request("DELETE", f"{package}/{version}/{name}").close()
+            return
+        base, (key, value) = packages()
+        query = urllib.parse.urlencode({"package_type": "generic", "package_name": package, "package_version": version})
+        listing = base.rsplit("/generic", 1)[0]
+        for found in json.loads(package_api("GET", f"{listing}?{query}", key, value)):
+            if found["name"] == package and found["version"] == version:
+                package_api("DELETE", f"{listing}/{found['id']}", key, value)
+    except urllib.error.URLError as error:
+        raise MirrorError(f"delete {package}/{version}: {getattr(error, 'code', error.reason)}") from error
+
+
 def load_receipt(receipt_file):
-    """The high side's last import: the registry's copy when MIRROR_LEDGER=true, else received.json."""
+    """The high side's last import: the store's copy when MIRROR_LEDGER=true, else received.json."""
     if ledger_enabled():
-        raw = package_get(RECEIPTS, "head", "received.json")
+        raw = store_get(RECEIPTS, "head", "received.json")
         return json.loads(raw) if raw else {}
     return json.loads(receipt_file.read_text()) if receipt_file.exists() else {}
 
@@ -251,7 +348,7 @@ def load_receipt(receipt_file):
 def save_receipt(receipt_file, receipt):
     write_json(receipt_file, receipt)
     if ledger_enabled():
-        package_put(RECEIPTS, "head", "received.json", receipt_file.read_bytes())
+        store_put(RECEIPTS, "head", "received.json", receipt_file.read_bytes())
 
 
 def ledger_records(last):
@@ -791,8 +888,11 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
         # A resend from the low side's export stands in for every bundle from manifest["from"] on.
         if (manifest["sequence"] != previous + 1 and not manifest["full"]
                 and manifest.get("from", previous + 2) > previous + 1):
-            raise SequenceGap(f"missing earlier bundle {previous + 1}; on the low side run "
-                              f"mirror.py export --sequence {previous + 1}.. or sync --full")
+            missing = (f"{previous + 1}" if manifest["sequence"] == previous + 2
+                       else f"{previous + 1} to {manifest['sequence'] - 1}")
+            raise SequenceGap(f"missing earlier bundle {missing} (imported up to {previous}, received "
+                              f"{manifest['sequence']}); on the low side, Run pipeline with "
+                              f"EXPORT_SEQUENCE={previous + 1}.. (mirror.py export --sequence {previous + 1}..)")
         for image in manifest["images"]:
             for tag in image["tags"]:
                 destination = f"docker://{high}/{image['target']}:{tag}"
@@ -829,11 +929,15 @@ def import_inbox(inbox, adopt_stream=False):
 
 
 def import_registry(name=None, adopt_stream=False):
-    """Import bundles NiFi uploaded to this project's generic package registry, oldest first.
+    """Import bundles NiFi uploaded to IMPORT_STORE (the generic package registry or S3), oldest first.
 
     name is the file a trigger announces. The receipt names the next sequence, so bundles
     whose trigger never arrived are fetched too. A bundle missing either file waits.
     """
+    if os.environ.get("IMPORT_DELETE_BUNDLES") == "true" and not s3_enabled() and not os.environ.get("PACKAGE_TOKEN"):
+        # Checked before importing: a job token reads packages but GitLab refuses it a delete (HTTP 403).
+        raise MirrorError("IMPORT_DELETE_BUNDLES with the package registry needs PACKAGE_TOKEN "
+                          "(a project access token, role Maintainer, scope api)")
     work = state_path("IMPORT_STATE_DIR", "quay-mirror-import")
     downloads = work / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
@@ -841,13 +945,17 @@ def import_registry(name=None, adopt_stream=False):
     def consume(stem, quiet=False):
         bundle = downloads / f"{stem}.tar"
         for path in (bundle.with_name(bundle.name + ".sha256"), bundle):
-            if not package_get(BUNDLES, stem, path.name, path):
+            if not store_get(BUNDLES, stem, path.name, path):
                 if not quiet:
                     print(f"waiting for {path.name}")
                 return False
         import_one(bundle, adopt_stream, superseded_ok=True)
         for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
             path.unlink()
+        if os.environ.get("IMPORT_DELETE_BUNDLES") == "true":
+            # Its images are in the high registry and the receipt has moved past it.
+            store_delete(BUNDLES, stem, [f"{stem}.tar", f"{stem}.tar.sha256"])
+            print(f"deleted from the store: {stem}")
         return True
 
     match = BUNDLE_NAME.fullmatch(name or "")
@@ -861,7 +969,14 @@ def import_registry(name=None, adopt_stream=False):
         while consume(f"quay-{stream}-{sequence:012d}", quiet=True):
             sequence += 1
     if match:
-        consume(match[1])
+        current = load_receipt(work / "received.json")
+        stem_stream, stem_sequence = match[1].split("-")[1], int(match[1].split("-")[2])
+        if current.get("stream") == stem_stream and stem_sequence <= current.get("sequence", 0):
+            # Imported already, by an earlier trigger or the catch-up above; its files may be gone.
+            done = "already imported" if stem_sequence == current.get("sequence") else "superseded"
+            print(f"{done}: {match[1]}.tar")
+        else:
+            consume(match[1])
 
 
 def pending(path):

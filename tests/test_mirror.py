@@ -266,7 +266,8 @@ class MirrorTest(unittest.TestCase):
         pack(self.stage, recovery, sequence=4, full=True, image=image)
         with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
             mirror.import_one(first)
-            with self.assertRaisesRegex(mirror.MirrorError, 'missing earlier'):
+            with self.assertRaisesRegex(mirror.MirrorError, r'missing earlier bundle 2 \(imported up to 1, received 3\)'
+                                                            r'.*EXPORT_SEQUENCE=2\.\.'):
                 mirror.import_one(gap)
             mirror.import_one(recovery)
             with self.assertRaisesRegex(mirror.MirrorError, 'refusing rollback'):
@@ -838,6 +839,47 @@ class LedgerTest(unittest.TestCase):
         # Without the registry's receipt the second run would push both bundles again.
         self.assertEqual(said.call_args_list[-1], mock.call(f'superseded: quay-{stream}-000000000001.tar'))
         self.assertEqual(json.loads(files[('quay-import-receipt', 'head', 'received.json')])['sequence'], 2)
+
+    def test_s3_store_signs_a_path_style_request_and_reads_a_missing_key_as_none(self):
+        os.environ.update({'IMPORT_STORE': 's3', 'S3_ENDPOINT': 'https://s3.example.internal:8443',
+                           'S3_BUCKET': 'quay-high', 'AWS_ACCESS_KEY_ID': 'AKIDEXAMPLE',
+                           'AWS_SECRET_ACCESS_KEY': 'secret'})
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"sequence": 4}'
+        with mock.patch.object(mirror.urllib.request, 'urlopen', return_value=response) as opened:
+            self.assertEqual(mirror.store_get('quay-import-receipt', 'head', 'received.json'), b'{"sequence": 4}')
+        request = opened.call_args.args[0]
+        self.assertEqual(request.full_url, 'https://s3.example.internal:8443/quay-high/quay-import-receipt/head/received.json')
+        os.environ['S3_PREFIX'] = 'mirror'  # no trailing slash: one is added
+        with mock.patch.object(mirror.urllib.request, 'urlopen', return_value=response) as opened:
+            mirror.store_get('quay-import-receipt', 'head', 'received.json')
+        self.assertEqual(opened.call_args.args[0].full_url,
+                         'https://s3.example.internal:8443/quay-high/mirror/quay-import-receipt/head/received.json')
+        del os.environ['S3_PREFIX']
+        self.assertRegex(request.get_header('Authorization'),
+                         r'^AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/[0-9]{8}/us-east-1/s3/aws4_request, '
+                         r'SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$')
+        missing = mirror.urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, None)
+        with mock.patch.object(mirror.urllib.request, 'urlopen', side_effect=missing):
+            self.assertIsNone(mirror.store_get('quay-bundles', 'x', 'x.tar'))
+
+    def test_delete_bundles_removes_each_import_and_a_late_trigger_is_already_imported(self):
+        files = self.store()
+        image, _ = fixture(self.stage)
+        stream, stem = 'e' * 32, f"quay-{'e' * 32}-000000000001"
+        pack(self.stage, self.root / f'{stem}.tar', sequence=1, image=image, stream=stream)
+        for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
+            files[('quay-bundles', stem, name)] = (self.root / name).read_bytes()
+        os.environ['IMPORT_DELETE_BUNDLES'] = 'true'
+        with self.assertRaisesRegex(mirror.MirrorError, 'needs PACKAGE_TOKEN'):  # a job token cannot delete
+            mirror.import_registry(f'{stem}.tar')
+        os.environ['PACKAGE_TOKEN'] = 'maintainer-token'
+        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
+                mock.patch.object(mirror, 'store_delete') as deleted, mock.patch('builtins.print') as said:
+            mirror.import_registry(f'{stem}.tar')
+            mirror.import_registry(f'{stem}.tar.sha256')  # the second file's trigger, after the delete
+        deleted.assert_called_once_with('quay-bundles', stem, [f'{stem}.tar', f'{stem}.tar.sha256'])
+        self.assertEqual(said.call_args_list[-1], mock.call(f'already imported: {stem}.tar'))
 
     def test_a_delivered_bundle_leaves_nothing_on_the_runner(self):
         self.store()

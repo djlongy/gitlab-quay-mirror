@@ -27,11 +27,21 @@ when it ends.
 | One record per bundle | low project, `quay-mirror-ledger/<sequence>/images.json` | none |
 | Images | low Quay, then high Quay | same |
 | SBOM and Grype report per sent image | low project, `quay-mirror-sbom/sha256-<hex>/` | none |
-| Bundles in transit | NiFi, then the high project's `quay-bundles/<bundle name>/` | `MIRROR_BUNDLE_DIR`, carried by hand |
-| Import receipt | high project, `quay-import-receipt/head/received.json` | `received.json` in `IMPORT_STATE_DIR` |
+| Bundles in transit | NiFi, then `quay-bundles/<bundle name>/` in `IMPORT_STORE`: the high project's package registry, or the S3 bucket | `MIRROR_BUNDLE_DIR`, carried by hand |
+| Import receipt | `quay-import-receipt/head/received.json` in the same store | `received.json` in `IMPORT_STATE_DIR` |
 
 GitLab keeps every upload of a generic package file and serves the newest. So `head/`
 always reads as the latest state, and the older uploads remain as history.
+
+Bundles are the bulk of the high side's storage. `IMPORT_DELETE_BUNDLES=true` deletes each
+one after its images are in the high registry, or an S3 lifecycle rule expires
+`quay-bundles/` after a few days. Never expire `quay-import-receipt/`: the receipt is a few
+hundred bytes, and it is what refuses a replayed old bundle that would roll a moved tag such
+as `latest` back, and what notices a lost one. The registry itself cannot tell you either:
+it shows which digests exist, not the order they arrived in.
+
+To move the high side between stores, copy `quay-import-receipt/head/received.json` to the
+new store first, then switch `IMPORT_STORE` and the NiFi upload processor.
 
 ## The sender state (`state.json`)
 
@@ -104,20 +114,32 @@ carries `"from": N`. The high side then accepts it over a gap that starts at N.
 Worked example: the high side imported bundle 6, then bundles 7 and 8 were lost in
 transit, and bundle 9 arrives.
 
-1. Import refuses 9: `missing earlier bundle 7; on the low side run mirror.py export --sequence 7..`.
+1. Import refuses 9: `missing earlier bundle 7 to 8 (imported up to 6, received 9); on the low side, Run pipeline with EXPORT_SEQUENCE=7..`.
 2. On the low side, Run pipeline with `EXPORT_SEQUENCE=7..`. Export writes bundle 10,
    holding the newest digest of every tag recorded in 7, 8 and 9, with `"from": 7`.
 3. The high side imports 10 over the gap (7 <= 6 + 1). Bundle 9 is now older than the
    receipt and is reported `superseded`.
 
+## What the high side fixes by itself
+
+- A missed pipeline trigger: the next import fetches every later bundle the receipt points
+  to, in order.
+- A bundle whose two files arrive apart, or bundles out of order: import prints `waiting for`
+  and the next trigger imports them.
+- A duplicate or late trigger: `already imported` or `superseded`, nothing pushed.
+
+A bundle lost on the way cannot heal on the high side: the link is one-way, so it cannot ask
+for it. The next bundle's import fails and names the missing range and the exact low-side
+action, `Run pipeline with EXPORT_SEQUENCE=N..`.
+
 ## Failures and recovery
 
 | What happened | What you see | What to do |
 |---|---|---|
-| A bundle never reached the high side | the next import names the missing sequence | `export --sequence N..` |
+| A bundle never reached the high side | the next import fails: `missing earlier bundle N to M (imported up to N-1, received M+1); on the low side, Run pipeline with EXPORT_SEQUENCE=N..` | exactly that |
 | A run died after reserving a sequence | `pending: true` in the ledger | nothing: the next sync is full and bridges it |
 | NiFi refused the POST | sync fails; the ledger records the bundle | rerun the pipeline (the next sync is full), or `export --sequence N` |
-| The high side lost its receipt | `--registry` replays the stream from bundle 1 out of `quay-bundles` (pushes are idempotent, later bundles win); `--inbox` refuses all but a full bundle | nothing with `--registry`; for `--inbox`, `sync --full` on the low side |
+| The high side lost its receipt | `--registry` replays the stream from bundle 1 out of `quay-bundles` (pushes are idempotent, later bundles win); with deleted or expired bundles, and with `--inbox`, it refuses all but a full bundle | with every bundle kept, nothing; otherwise Run pipeline on the low side with `MIRROR_FULL=true` |
 | The ledger was deleted | sync starts a new stream | import its first bundle with `--adopt-stream` after review |
 | Upstream deleted an old digest | a resend of that image fails | update the catalog; low Quay still holds every image it ever received |
 

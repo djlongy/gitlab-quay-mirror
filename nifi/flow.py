@@ -29,7 +29,10 @@ import urllib.request
 DEFAULTS = {"low": {"quay.port": "9098", "quay.diode": "/diode/quay"},
             "high": {"quay.diode": "/diode/quay", "gitlab.api": "https://gitlab.example.com/api/v4",
                      "gitlab.project": "", "gitlab.ref": "main", "gitlab.token": ""}}
-SENSITIVE = {"gitlab.token"}
+# --store s3: the high side files bundles in an S3-compatible bucket instead of the generic package registry.
+S3_DEFAULTS = {"s3.endpoint": "", "s3.bucket": "", "s3.region": "us-east-1", "s3.prefix": "",
+               "s3.access_key": "", "s3.secret_key": "", "s3.ca": ""}
+SENSITIVE = {"gitlab.token", "s3.access_key", "s3.secret_key"}
 
 
 class Nifi:
@@ -69,6 +72,24 @@ class Nifi:
                          {"revision": {"version": 0}, "component": {"type": full, "bundle": self.types[full], "name": name,
                                                                     "position": {"x": 0, "y": y * 180}, "config": cfg}})["id"]
 
+    def service(self, pg, type_name, name, props):
+        """Create a controller service in the group and enable it; its id goes in processor properties."""
+        types = {t["type"]: t["bundle"] for t in self.call("GET", "/flow/controller-service-types")["controllerServiceTypes"]}
+        full = next(t for t in types if t.endswith("." + type_name))
+        created = self.call("POST", f"/process-groups/{pg}/controller-services",
+                            {"revision": {"version": 0},
+                             "component": {"type": full, "bundle": types[full], "name": name, "properties": props}})
+        for _ in range(30):
+            current = self.call("GET", f"/controller-services/{created['id']}")
+            if current["component"]["validationStatus"] == "VALID":
+                break
+            time.sleep(1)
+        else:
+            raise SystemExit(f"{name}: {current['component'].get('validationErrors')}")
+        self.call("PUT", f"/controller-services/{created['id']}/run-status",
+                  {"revision": current["revision"], "state": "ENABLED"})
+        return created["id"]
+
     def resolve(self, full, props):
         """Property keys as this NiFi names them. "A|B" tries each spelling, by name or display name,
         since NiFi versions rename properties. A key the processor does not define is dynamic and stays."""
@@ -96,6 +117,8 @@ def replace_group(n, root, name, params):
     for g in n.call("GET", f"/process-groups/{root}/process-groups")["processGroups"]:
         if g["component"]["name"] == name:
             n.call("PUT", f"/flow/process-groups/{g['id']}", {"id": g["id"], "state": "STOPPED"})
+            # A group with enabled controller services cannot be deleted.
+            n.call("PUT", f"/flow/process-groups/{g['id']}/controller-services", {"id": g["id"], "state": "DISABLED"})
             time.sleep(2)
             n.call("POST", f"/process-groups/{g['id']}/empty-all-connections-requests")
             time.sleep(1)
@@ -132,7 +155,7 @@ def build_low(n, pg):
     return [listen, remember, package, rename, put]
 
 
-def build_high(n, pg):
+def build_high(n, pg, store="gitlab"):
     gitlab = "#{gitlab.api}/projects/#{gitlab.project}"
     listing = n.processor(pg, "ListFile", "List the diode", 0,
                           {"Input Directory": "#{quay.diode}", "File Filter": r".*\.ffv3",
@@ -148,11 +171,25 @@ def build_high(n, pg):
     hashing = n.processor(pg, "CryptographicHashContent", "Hash file", 4, {"Hash Algorithm": "SHA-256"})
     verified = n.processor(pg, "RouteOnAttribute", "File matches X-Sha256", 5, {
         "Routing Strategy": "Route to Property name", "verified": "${content_SHA-256:equals(${X-Sha256})}"})
-    upload = n.processor(pg, "InvokeHTTP", "Upload to GitLab", 6, {
-        "HTTP Method": "PUT", "Request Body Enabled": "true",
-        "HTTP URL": gitlab + "/packages/generic/quay-bundles/${filename:substringBefore('.tar')}/${filename}",
-        "PRIVATE-TOKEN": "#{gitlab.token}", "Response Body Attribute Name": "gitlab.response"},
-        terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
+    if store == "s3":
+        credentials = n.service(pg, "AWSCredentialsProviderControllerService", "S3 credentials",
+                                {"Access Key": "#{s3.access_key}", "Secret Key": "#{s3.secret_key}"})
+        trust = n.service(pg, "PEMEncodedSSLContextProvider", "S3 CA", {
+            "Private Key Source": "UNDEFINED", "Certificate Authorities Source": "PROPERTIES",
+            "Certificate Authorities": "#{s3.ca}"})
+        # The same <package>/<version>/<file> layout as the generic package, so import reads either store.
+        upload = n.processor(pg, "PutS3Object", "Upload to S3", 6, {
+            "Bucket": "#{s3.bucket}", "Region": "#{s3.region}", "Endpoint Override URL": "#{s3.endpoint}",
+            # s3.prefix matches the pipeline's S3_PREFIX, kept with a trailing slash.
+            "Object Key": "#{s3.prefix}quay-bundles/${filename:substringBefore('.tar')}/${filename}",
+            "use-path-style-access": "true", "AWS Credentials Provider service": credentials,
+            "SSL Context Service": trust})
+    else:
+        upload = n.processor(pg, "InvokeHTTP", "Upload to GitLab", 6, {
+            "HTTP Method": "PUT", "Request Body Enabled": "true",
+            "HTTP URL": gitlab + "/packages/generic/quay-bundles/${filename:substringBefore('.tar')}/${filename}",
+            "PRIVATE-TOKEN": "#{gitlab.token}", "Response Body Attribute Name": "gitlab.response"},
+            terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
     start = n.processor(pg, "InvokeHTTP", "Start the import pipeline", 7, {
         "HTTP Method": "POST", "Request Body Enabled": "false",
         # variables[][key]=BUNDLE&variables[][value]=<file>, brackets encoded
@@ -173,9 +210,13 @@ def build_high(n, pg):
     n.connect(pg, hashing, rejected, ["failure"])
     n.connect(pg, verified, upload, ["verified"])
     n.connect(pg, verified, rejected, ["unmatched"])
-    n.connect(pg, upload, start, ["Original"])
-    n.connect(pg, upload, upload, ["Retry"])
-    n.connect(pg, upload, rejected, ["No Retry", "Failure"])
+    if store == "s3":
+        n.connect(pg, upload, start, ["success"])
+        n.connect(pg, upload, rejected, ["failure"])
+    else:
+        n.connect(pg, upload, start, ["Original"])
+        n.connect(pg, upload, upload, ["Retry"])
+        n.connect(pg, upload, rejected, ["No Retry", "Failure"])
     n.connect(pg, start, done, ["Original"])
     n.connect(pg, start, start, ["Retry"])
     n.connect(pg, start, rejected, ["No Retry", "Failure"])
@@ -192,26 +233,41 @@ def main():
                     "gitlab.token is read from GITLAB_TOKEN when not given")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (self-signed NiFi)")
     ap.add_argument("--export", help="also write the group's flow definition to this file")
+    ap.add_argument("--store", choices=("gitlab", "s3"), default="gitlab",
+                    help="high side: where bundles wait for import (the pipeline's IMPORT_STORE)")
     args = ap.parse_args()
     if not args.password:
         raise SystemExit("set --password or NIFI_PASSWORD")
-    params = dict(DEFAULTS[args.side], **dict(p.split("=", 1) for p in args.param))
+    defaults = dict(DEFAULTS[args.side], **(S3_DEFAULTS if args.store == "s3" else {}))
+    params = dict(defaults, **dict(p.split("=", 1) for p in args.param))
     if args.side == "high":
         params["gitlab.token"] = params["gitlab.token"] or os.environ.get("GITLAB_TOKEN", "")
         if not params["gitlab.project"] or not params["gitlab.token"]:
             raise SystemExit("high side needs --param gitlab.project=<id> and GITLAB_TOKEN")
+        if args.store == "s3":
+            params["s3.access_key"] = params["s3.access_key"] or os.environ.get("AWS_ACCESS_KEY_ID", "")
+            params["s3.secret_key"] = params["s3.secret_key"] or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+            params["s3.prefix"] = params["s3.prefix"].strip("/") + "/" if params["s3.prefix"].strip("/") else ""
+            if params["s3.ca"].startswith("@"):  # a PEM file, read here so the parameter holds the text
+                params["s3.ca"] = open(params["s3.ca"][1:], encoding="utf-8").read()
+            missing = [k for k in ("s3.endpoint", "s3.bucket", "s3.access_key", "s3.secret_key", "s3.ca") if not params[k]]
+            if missing:
+                raise SystemExit(f"--store s3 needs {', '.join(missing)} (keys from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)")
     n = Nifi(args.url, args.user, args.password, not args.insecure)
     n.login()
     root = n.call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
     pg = replace_group(n, root, f"quay {args.side} side", params)
-    (build_low if args.side == "low" else build_high)(n, pg)
+    if args.side == "low":
+        build_low(n, pg)
+    else:
+        build_high(n, pg, args.store)
     # Start every processor but the two end points, whose queues are the record.
     n.call("PUT", f"/flow/process-groups/{pg}", {"id": pg, "state": "RUNNING"})
     for p in n.call("GET", f"/process-groups/{pg}/processors")["processors"]:
         if p["component"]["name"] in ("Delivered", "Rejected (inspect queue)"):
             n.call("PUT", f"/processors/{p['id']}/run-status",
                    {"revision": p["revision"], "state": "STOPPED"})
-    shown = {k: ("***" if k in SENSITIVE else v) for k, v in params.items()}
+    shown = {k: ("***" if k in SENSITIVE else "<pem>" if k == "s3.ca" else v) for k, v in params.items()}
     print(f"quay {args.side} side running in process group {pg}: {shown}")
     if args.export:
         req = urllib.request.Request(f"{n.api}/process-groups/{pg}/download", headers={"Authorization": f"Bearer {n.token}"})
