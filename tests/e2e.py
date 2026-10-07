@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Exercise real registry transfers using the normal CLI (isolated test repositories only).
 
-Log in to both registries with skopeo first. E2E_FIXTURES=true pushes two OCI indexes;
-otherwise E2E_SOURCE and E2E_UPDATE_SOURCE name upstream tags, e.g. Docker manifest lists.
+Log in to both registries with skopeo first and set E2E_LOW_REGISTRY and E2E_HIGH_REGISTRY
+(E2E_TLS_VERIFY=false for plain HTTP). Each CLI call gets one of them as TARGET_REGISTRY, as the
+low and high projects would. E2E_FIXTURES=true pushes two OCI indexes; otherwise E2E_SOURCE and
+E2E_UPDATE_SOURCE name source tags, e.g. Docker manifest lists.
 """
 import gzip
 import hashlib
@@ -23,8 +25,10 @@ import mirror
 
 
 def cli(*args, fail=None):
+    side = 'high' if args[0] == 'import' else 'low'
     result = subprocess.run([sys.executable, str(ROOT / 'mirror.py'), '--catalog', str(catalog), *args],
-                            capture_output=True, text=True, check=False)
+                            capture_output=True, text=True, check=False,
+                            env=dict(os.environ, TARGET_REGISTRY=REGISTRIES[side]))
     print(result.stdout, end='', flush=True)
     if fail:
         assert result.returncode != 0 and fail in result.stderr, result.stdout + result.stderr
@@ -35,7 +39,7 @@ def cli(*args, fail=None):
 
 
 def last_bundle():
-    return max(outbox.glob('quay-*.tar'))
+    return max(outbox.glob('mirror-*.tar'))
 
 
 def transfer(bundle):
@@ -45,11 +49,11 @@ def transfer(bundle):
 
 
 def compare(image):
-    for side in ('LOW_QUAY', 'HIGH_QUAY'):
-        actual = mirror.raw_digest(f"docker://{os.environ[side + '_HOST']}/{image['target']}:{image['tag']}", side)
+    for side, host in REGISTRIES.items():
+        actual = mirror.raw_digest(f"docker://{host}/{image['target']}:{image['tag']}", 'TARGET_REGISTRY')
         assert actual == image['digest'], (side, image['target'], actual)
-    raw = mirror.run('skopeo', 'inspect', '--raw', *mirror.options('HIGH_QUAY'),
-                    f"docker://{os.environ['HIGH_QUAY_HOST']}/{image['target']}:{image['tag']}")
+    raw = mirror.run('skopeo', 'inspect', '--raw', *mirror.options('TARGET_REGISTRY'),
+                    f"docker://{REGISTRIES['high']}/{image['target']}:{image['tag']}")
     platforms = [child.get('platform', {}) for child in json.loads(raw).get('manifests', [])]
     assert len(platforms) >= 2, 'test image must retain a multi-platform index'
     return {'image': image['target'] + ':' + image['tag'], 'digest': image['digest'], 'platforms': platforms}
@@ -88,17 +92,17 @@ def seed_fixtures(directory, target):
         index['annotations'] = {'org.opencontainers.image.ref.name': version}
         (layout / 'oci-layout').write_text('{"imageLayoutVersion":"1.0.0"}')
         (layout / 'index.json').write_text(json.dumps({'schemaVersion': 2, 'manifests': [index]}))
-        source = os.environ['LOW_QUAY_HOST'] + '/' + target + '-source:' + version
-        mirror.copy(f'oci:{layout}:{version}', 'docker://' + source, destination_side='LOW_QUAY')
+        source = REGISTRIES['low'] + '/' + target + '-source:' + version
+        mirror.copy(f'oci:{layout}:{version}', 'docker://' + source, destination_side='TARGET_REGISTRY')
         sources.append(source + '@' + index['digest'])
-    os.environ['UPSTREAM_TLS_VERIFY'] = os.environ.get('LOW_QUAY_TLS_VERIFY', 'true')
     return sources
 
 
 if __name__ == '__main__':
-    for key in ('LOW_QUAY_HOST', 'HIGH_QUAY_HOST'):
-        mirror.required_env(key)
-    with tempfile.TemporaryDirectory(prefix='quay-mirror-e2e-') as temporary:
+    REGISTRIES = {'low': mirror.required_env('E2E_LOW_REGISTRY'), 'high': mirror.required_env('E2E_HIGH_REGISTRY')}
+    tls = os.environ.get('E2E_TLS_VERIFY', 'true')
+    os.environ.update(TARGET_REGISTRY_TLS_VERIFY=tls, SOURCE_REGISTRY_TLS_VERIFY=tls)
+    with tempfile.TemporaryDirectory(prefix='registry-mirror-e2e-') as temporary:
         directory = Path(temporary)
         catalog = directory / 'images.txt'
         outbox, inbox = directory / 'out', directory / 'in'
@@ -138,7 +142,7 @@ if __name__ == '__main__':
         cli('sync')
         missing = transfer(last_bundle())
         cli('import', str(missing), fail='missing earlier bundle')
-        cli('sync', '--full')
+        cli('sync', '--all')
         recovery = transfer(last_bundle())
         cli('import', str(recovery))
         cli('import', str(recovery))

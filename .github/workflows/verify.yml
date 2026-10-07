@@ -30,9 +30,8 @@ jobs:
           curl --retry 10 --retry-delay 1 --retry-connrefused --fail http://127.0.0.1:15001/v2/
       - name: Real multi-platform mirror, transfer, import and recovery
         env:
-          LOW_QUAY_HOST: 127.0.0.1:15000
-          HIGH_QUAY_HOST: 127.0.0.1:15001
-          LOW_QUAY_TLS_VERIFY: 'false'
-          HIGH_QUAY_TLS_VERIFY: 'false'
+          E2E_LOW_REGISTRY: 127.0.0.1:15000
+          E2E_HIGH_REGISTRY: 127.0.0.1:15001
+          E2E_TLS_VERIFY: 'false'
           E2E_FIXTURES: 'true'
         run: python3 tests/e2e.py

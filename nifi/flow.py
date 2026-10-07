@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Build the NiFi flows that carry quay-*.tar bundles across a one-way link into a high GitLab. Stdlib only.
+"""Build the NiFi flows that carry mirror-*.tar bundles across a one-way link to the high side. Stdlib only.
 
 usage: flow.py --side low|high [--url https://nifi:8443] [--user admin] [--password ...]
                [--param name=value ...] [--insecure] [--export FILE]
 
-low:  ListenHTTP :#{quay.port}/contentListener   (sync and export POST each file here, NIFI_URL)
+low:  ListenHTTP :#{mirror.port}/contentListener   (sync and resend POST each file here, NIFI_URL)
         -> PackageFlowFile                       (keeps Filename and the X- headers with the content)
-        -> PutFile #{quay.diode}                 (the diode's ingress directory, as <file>.ffv3)
-high: ListFile #{quay.diode} -> FetchFile        (the diode's egress directory; deletes what it takes)
+        -> PutFile #{mirror.diode}                 (the diode's ingress directory, as <file>.ffv3)
+high: ListFile #{mirror.diode} -> FetchFile        (the diode's egress directory; deletes what it takes)
         -> UnpackContent flowfile-stream-v3      (the original file and its attributes again)
         -> RouteOnAttribute container-images     (X-Artifact-Type and X-Artifact-Action)
         -> CryptographicHashContent -> RouteOnAttribute verified   (content matches X-Sha256)
-        -> InvokeHTTP PUT  generic package quay-bundles/<bundle>/<file>   (PRIVATE-TOKEN)
+        -> InvokeHTTP PUT  generic package registry-mirror-bundles/<bundle>/<file>   (PRIVATE-TOKEN)
         -> InvokeHTTP POST pipeline?ref=#{gitlab.ref} with BUNDLE=<file> (mirror.py import --registry)
 
 Anything not matching ends in "Rejected (inspect queue)", left stopped so it waits there.
@@ -26,8 +26,8 @@ import time
 import urllib.parse
 import urllib.request
 
-DEFAULTS = {"low": {"quay.port": "9098", "quay.diode": "/diode/quay"},
-            "high": {"quay.diode": "/diode/quay", "gitlab.api": "https://gitlab.example.com/api/v4",
+DEFAULTS = {"low": {"mirror.port": "9098", "mirror.diode": "/diode/mirror"},
+            "high": {"mirror.diode": "/diode/mirror", "gitlab.api": "https://gitlab.example.com/api/v4",
                      "gitlab.project": "", "gitlab.ref": "main", "gitlab.token": ""}}
 # --store s3: the high side files bundles in an S3-compatible bucket instead of the generic package registry.
 S3_DEFAULTS = {"s3.endpoint": "", "s3.bucket": "", "s3.region": "us-east-1", "s3.prefix": "",
@@ -114,8 +114,10 @@ class Nifi:
 
 def replace_group(n, root, name, params):
     """Remove a group of this name and its parameter context, then create both afresh."""
+    # "quay <side> side" is this flow's name before the registry-neutral rename.
+    legacy = name.replace("registry mirror", "quay", 1)
     for g in n.call("GET", f"/process-groups/{root}/process-groups")["processGroups"]:
-        if g["component"]["name"] == name:
+        if g["component"]["name"] in (name, legacy):
             n.call("PUT", f"/flow/process-groups/{g['id']}", {"id": g["id"], "state": "STOPPED"})
             # A group with enabled controller services cannot be deleted.
             n.call("PUT", f"/flow/process-groups/{g['id']}/controller-services", {"id": g["id"], "state": "DISABLED"})
@@ -123,10 +125,10 @@ def replace_group(n, root, name, params):
             n.call("POST", f"/process-groups/{g['id']}/empty-all-connections-requests")
             time.sleep(1)
             version = n.call("GET", f"/process-groups/{g['id']}")["revision"]["version"]
-            n.call("DELETE", f"/process-groups/{g['id']}?version={version}&clientId=quay")
+            n.call("DELETE", f"/process-groups/{g['id']}?version={version}&clientId=registry-mirror")
     for c in n.call("GET", "/flow/parameter-contexts")["parameterContexts"]:
         if c["component"]["name"] == name:
-            n.call("DELETE", f"/parameter-contexts/{c['id']}?version={c['revision']['version']}&clientId=quay")
+            n.call("DELETE", f"/parameter-contexts/{c['id']}?version={c['revision']['version']}&clientId=registry-mirror")
     ctx = n.call("POST", "/parameter-contexts", {"revision": {"version": 0}, "component": {
         "name": name, "parameters": [{"parameter": {"name": k, "value": v, "sensitive": k in SENSITIVE}}
                                      for k, v in params.items()]}})
@@ -137,7 +139,7 @@ def replace_group(n, root, name, params):
 
 def build_low(n, pg):
     listen = n.processor(pg, "ListenHTTP", "Receive bundle", 0,
-                         {"Listening Port": "#{quay.port}", "Base Path": "contentListener",
+                         {"Listening Port": "#{mirror.port}", "Base Path": "contentListener",
                           # The Filename header becomes the filename; X- headers become attributes as named.
                           "HTTP Headers for Attributes|HTTP Headers to receive as Attributes (Regex)": "(?i)x-.*"})
     remember = n.processor(pg, "UpdateAttribute", "Remember the name", 1, {"diode.name": "${filename}"})
@@ -145,7 +147,7 @@ def build_low(n, pg):
     # PackageFlowFile names its output by UUID; the package itself still carries the original filename.
     rename = n.processor(pg, "UpdateAttribute", "Name the package", 3, {"filename": "${diode.name}.ffv3"})
     put = n.processor(pg, "PutFile", "Into the diode", 4,
-                      {"Directory": "#{quay.diode}", "Conflict Resolution Strategy": "fail",
+                      {"Directory": "#{mirror.diode}", "Conflict Resolution Strategy": "fail",
                        "Create Missing Directories": "true"}, terminate=("success",))
     n.connect(pg, listen, remember, ["success"])
     n.connect(pg, remember, package, ["success"])
@@ -158,7 +160,7 @@ def build_low(n, pg):
 def build_high(n, pg, store="gitlab"):
     gitlab = "#{gitlab.api}/projects/#{gitlab.project}"
     listing = n.processor(pg, "ListFile", "List the diode", 0,
-                          {"Input Directory": "#{quay.diode}", "File Filter": r".*\.ffv3",
+                          {"Input Directory": "#{mirror.diode}", "File Filter": r".*\.ffv3",
                            "Recurse Subdirectories": "false", "Minimum File Age": "5 sec"}, schedule="10 sec")
     fetch = n.processor(pg, "FetchFile", "Take from the diode", 1, {"Completion Strategy": "Delete File"},
                         terminate=("not.found",))
@@ -167,7 +169,7 @@ def build_high(n, pg, store="gitlab"):
     route = n.processor(pg, "RouteOnAttribute", "Container bundles only", 3, {
         "Routing Strategy": "Route to Property name",
         "container-images": "${X-Artifact-Type:equals('container-images'):and(${X-Artifact-Action:equals('mirror')})"
-                            ":and(${filename:matches('quay-[0-9a-f]{32}-[0-9]{12}[.]tar([.]sha256)?')})}"})
+                            ":and(${filename:matches('mirror-[0-9a-f]{32}-[0-9]{12}[.]tar([.]sha256)?')})}"})
     hashing = n.processor(pg, "CryptographicHashContent", "Hash file", 4, {"Hash Algorithm": "SHA-256"})
     verified = n.processor(pg, "RouteOnAttribute", "File matches X-Sha256", 5, {
         "Routing Strategy": "Route to Property name", "verified": "${content_SHA-256:equals(${X-Sha256})}"})
@@ -181,13 +183,13 @@ def build_high(n, pg, store="gitlab"):
         upload = n.processor(pg, "PutS3Object", "Upload to S3", 6, {
             "Bucket": "#{s3.bucket}", "Region": "#{s3.region}", "Endpoint Override URL": "#{s3.endpoint}",
             # s3.prefix matches the pipeline's S3_PREFIX, kept with a trailing slash.
-            "Object Key": "#{s3.prefix}quay-bundles/${filename:substringBefore('.tar')}/${filename}",
+            "Object Key": "#{s3.prefix}registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
             "use-path-style-access": "true", "AWS Credentials Provider service": credentials,
             "SSL Context Service": trust})
     else:
         upload = n.processor(pg, "InvokeHTTP", "Upload to GitLab", 6, {
             "HTTP Method": "PUT", "Request Body Enabled": "true",
-            "HTTP URL": gitlab + "/packages/generic/quay-bundles/${filename:substringBefore('.tar')}/${filename}",
+            "HTTP URL": gitlab + "/packages/generic/registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
             "PRIVATE-TOKEN": "#{gitlab.token}", "Response Body Attribute Name": "gitlab.response"},
             terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
     start = n.processor(pg, "InvokeHTTP", "Start the import pipeline", 7, {
@@ -256,7 +258,7 @@ def main():
     n = Nifi(args.url, args.user, args.password, not args.insecure)
     n.login()
     root = n.call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
-    pg = replace_group(n, root, f"quay {args.side} side", params)
+    pg = replace_group(n, root, f"registry mirror {args.side} side", params)
     if args.side == "low":
         build_low(n, pg)
     else:
@@ -268,7 +270,7 @@ def main():
             n.call("PUT", f"/processors/{p['id']}/run-status",
                    {"revision": p["revision"], "state": "STOPPED"})
     shown = {k: ("***" if k in SENSITIVE else "<pem>" if k == "s3.ca" else v) for k, v in params.items()}
-    print(f"quay {args.side} side running in process group {pg}: {shown}")
+    print(f"registry mirror {args.side} side running in process group {pg}: {shown}")
     if args.export:
         req = urllib.request.Request(f"{n.api}/process-groups/{pg}/download", headers={"Authorization": f"Bearer {n.token}"})
         with urllib.request.urlopen(req, timeout=60, context=n.ctx) as r:

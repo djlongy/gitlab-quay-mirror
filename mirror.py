@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mirror reviewed container images into low Quay; export and import verified offline bundles."""
+"""Mirror reviewed container images into a registry and carry them across a one-way link in verified bundles."""
 
 import argparse
 import fcntl
@@ -33,8 +33,8 @@ IMAGE_LAYER = re.compile(r"application/vnd\.oci\.image\.layer\.(?:nondistributab
 MANIFESTS = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json")
 CHART_CONFIG = "application/vnd.cncf.helm.config.v1+json"
 CHART_LAYERS = ("application/vnd.cncf.helm.chart.content.v1.tar+gzip", "application/vnd.cncf.helm.chart.provenance.v1.prov")
-LEDGER, BUNDLES, RECEIPTS = "quay-mirror-ledger", "quay-bundles", "quay-import-receipt"
-BUNDLE_NAME = re.compile(r"(quay-[0-9a-f]{32}-[0-9]{12})\.tar(?:\.sha256)?")
+LEDGER, BUNDLES, RECEIPTS = "registry-mirror-ledger", "registry-mirror-bundles", "registry-mirror-receipt"
+BUNDLE_NAME = re.compile(r"(mirror-[0-9a-f]{32}-[0-9]{12})\.tar(?:\.sha256)?")
 INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
 
 
@@ -54,9 +54,9 @@ def required_env(name):
 
 
 def registry(side):
-    value = required_env(f"{side}_HOST")
+    value = required_env(side)
     if not re.fullmatch(r"[a-z0-9.-]+(?::[0-9]+)?", value):
-        raise MirrorError(f"{side}_HOST must be a registry host[:port], without scheme or path")
+        raise MirrorError(f"{side} must be a registry host[:port], without scheme or path")
     return value
 
 
@@ -146,9 +146,16 @@ def raw_digest(reference, side):
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
-def fetch_manifest(reference, side="UPSTREAM"):
+def side_of(reference):
+    """Which registry's settings read a catalog source: TARGET_REGISTRY when the image already
+    lives there (your own build in the low registry), else SOURCE_REGISTRY."""
+    host = reference.split("://", 1)[-1].split("/", 1)[0]
+    return "TARGET_REGISTRY" if host and host == os.environ.get("TARGET_REGISTRY", "").strip().rstrip("/") else "SOURCE_REGISTRY"
+
+
+def fetch_manifest(reference, side=None):
     """The manifest bytes at reference@digest, checked against that digest."""
-    raw = run("skopeo", "inspect", "--raw", *options(side), reference)
+    raw = run("skopeo", "inspect", "--raw", *options(side or side_of(reference)), reference)
     if "sha256:" + hashlib.sha256(raw).hexdigest() != reference.rsplit("@", 1)[1]:
         raise MirrorError(f"manifest digest mismatch: {reference}")
     return raw
@@ -422,7 +429,7 @@ def add_image(path, source, target):
     name = source.split("@", 1)[0]
     if not SOURCE.fullmatch(name) or not TARGET.fullmatch(target):
         raise MirrorError("add needs [registry/]repo:tag and org/repo[/path]")
-    raw = run("skopeo", "inspect", "--raw", *options("UPSTREAM"), "docker://" + transport_reference(source))
+    raw = run("skopeo", "inspect", "--raw", *options(side_of(source)), "docker://" + transport_reference(source))
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if not runnable(json.loads(raw), lambda child: fetch_manifest(f"docker://{name.rsplit(':', 1)[0]}@{child}")):
         raise MirrorError(f"{name} is a signature, attestation or metadata artifact, not a container image; "
@@ -431,8 +438,8 @@ def add_image(path, source, target):
     if "@" in source and source.split("@", 1)[1] != digest:
         raise MirrorError("source digest does not match the manifest")
     repository = "docker://" + name.rsplit(":", 1)[0]
-    tags = publish_tags(image["tag"], platform_digest(f"{repository}@{digest}", digest, "UPSTREAM"),
-                        repository, "UPSTREAM")
+    tags = publish_tags(image["tag"], platform_digest(f"{repository}@{digest}", digest, side_of(source)),
+                        repository, side_of(source))
     images = catalog(path) if path.exists() else []
     if any((i['target'], i['tag']) == (target, image['tag']) for i in images):
         raise MirrorError("target tag already exists; edit its reviewed catalog entry")
@@ -523,9 +530,9 @@ def verify_platform(directory, image):
 
 
 def publish_tags(tag, transfer, repository, side):
-    """The tags an image gets on both Quays: the upstream tag, unchanged.
+    """The tags an image gets on both target registries: the source tag, unchanged.
 
-    latest names no release, and once it moves Quay garbage-collects the untagged
+    latest names no release, and once it moves the registry may garbage-collect the untagged
     old image. A latest image is therefore also tagged with the version it reports.
     """
     if tag != "latest":
@@ -582,11 +589,11 @@ def notify(bundle, kind):
 
 
 def sync(path, full=False):
-    low = registry("LOW_QUAY")
+    low = registry("TARGET_REGISTRY")
     images = catalog(path)
     if not images:
         raise MirrorError("catalog is empty; add an image before syncing")
-    work = state_path("MIRROR_STATE_DIR", "quay-mirror")
+    work = state_path("MIRROR_STATE_DIR", "registry-mirror")
     with locked(work):
         state_file = work / "sent.json"
         state = load_state(state_file) or {
@@ -604,17 +611,17 @@ def sync(path, full=False):
             key = f"{image['target']}:{image['tag']}"
             # The ledger records the platform too, so changing MIRROR_PLATFORM resends the image.
             sent = f"{image['digest']} {platform}".strip()
-            # Pin the source by digest; upstream tag movement cannot change approved bytes.
+            # Pin the source by digest; source tag movement cannot change approved bytes.
             source = transport_reference(image["source"])
-            # Remember each platform and tag choice so an unchanged image needs no upstream request.
+            # Remember each platform and tag choice so an unchanged image needs no source request.
             lookup = f"{image['digest']} {platform} {image['tag']}"
-            # A full sync is a recovery, so it asks upstream again.
+            # A full sync is a recovery, so it asks the source again.
             cached = None if full else known.get(lookup)
             if isinstance(cached, list) and len(cached) == 2 and isinstance(cached[1], list):
                 transfer, tags = cached
             else:
-                transfer = platform_digest("docker://" + source, image["digest"], "UPSTREAM")
-                tags = publish_tags(image["tag"], transfer, "docker://" + source.split("@")[0], "UPSTREAM")
+                transfer = platform_digest("docker://" + source, image["digest"], side_of(source))
+                tags = publish_tags(image["tag"], transfer, "docker://" + source.split("@")[0], side_of(source))
             if tags != ["latest"]:  # a latest image with no version yet is asked again next run
                 platforms[lookup] = [transfer, tags]
             for tag in tags[1:]:
@@ -632,22 +639,22 @@ def sync(path, full=False):
             for number, tag in enumerate(tags):
                 destination = f"docker://{low}/{image['target']}:{tag}"
                 observed = None
-                if tag in known_tags:
+                if tag in known_tags or side_of(source) == "TARGET_REGISTRY":  # an own image is already there
                     try:
-                        observed = raw_digest(destination, "LOW_QUAY")
+                        observed = raw_digest(destination, "TARGET_REGISTRY")
                     except MirrorError as error:
                         # Missing, deleted or expired: copy it again; a real fault fails the copy below.
                         say(f"low copy unreadable, recopying: {error}")
                 if observed == transfer:
-                    print(f"already in low Quay: {low}/{image['target']}:{tag}@{transfer}")
+                    print(f"already in target registry: {low}/{image['target']}:{tag}@{transfer}")
                     continue
-                if number:  # a version tag points at the image already in low Quay
-                    copy(f"docker://{low}/{image['target']}@{transfer}", destination, "LOW_QUAY", "LOW_QUAY")
+                if number:  # a version tag points at the image already in the target registry
+                    copy(f"docker://{low}/{image['target']}@{transfer}", destination, "TARGET_REGISTRY", "TARGET_REGISTRY")
                 else:
-                    copy("docker://" + source.split("@")[0] + "@" + transfer, destination, "UPSTREAM", "LOW_QUAY")
-                if raw_digest(destination, "LOW_QUAY") != transfer:
+                    copy("docker://" + source.split("@")[0] + "@" + transfer, destination, side_of(source), "TARGET_REGISTRY")
+                if raw_digest(destination, "TARGET_REGISTRY") != transfer:
                     raise MirrorError(f"low mirror digest mismatch: {image['target']}:{tag}")
-                print(f"pushed to low Quay: {low}/{image['target']}:{tag}@{transfer}")
+                print(f"pushed to target registry: {low}/{image['target']}:{tag}@{transfer}")
             names = f"{image['target']}:{', :'.join(tags)}"
             due = full or state["sent"].get(key) != sent or aliases != tags[1:]
             if due:
@@ -659,7 +666,7 @@ def sync(path, full=False):
         if changed and not bundle_destination():
             # The ledger says what crossed to the high side, so it records only a bundle that left.
             save_state(state_file, state, remote=json.dumps(state, sort_keys=True) != loaded)
-            print(f"low Quay updated; {len(changed)} image(s) not sent to the high side: "
+            print(f"target registry updated; {len(changed)} image(s) not sent to the high side: "
                   "set NIFI_URL, or MIRROR_BUNDLE_DIR to hand-carry bundles")
             return None
         if not changed:
@@ -683,7 +690,7 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
     platform = os.environ.get("MIRROR_PLATFORM", "").strip()
     outbox = Path(os.environ.get("MIRROR_BUNDLE_DIR") or work / "bundles")
     outbox.mkdir(parents=True, exist_ok=True)
-    # Reserve a sequence before publishing. An interrupted export forces the next one full.
+    # Reserve a sequence before publishing. An interrupted run forces the next one full.
     state.update(sequence=state["sequence"] + 1, pending=True)
     save_state(state_file, state)
     metadata = {"schema": 1, "stream": state["stream"], "sequence": state["sequence"], "full": full,
@@ -696,23 +703,23 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
             if not directory.exists():
                 # dir: keeps a Docker manifest list byte for byte; oci: would have to convert it.
                 try:
-                    copy(f"docker://{low}/{image['target']}@{image['transfer']}", f"dir:{directory}", "LOW_QUAY")
+                    copy(f"docker://{low}/{image['target']}@{image['transfer']}", f"dir:{directory}", "TARGET_REGISTRY")
                 except MirrorError:
                     if kind != "resend":
                         raise
-                    # Low Quay lost it: a resend takes the same digest from upstream.
+                    # The target registry lost it: a resend takes the same digest from the source.
                     shutil.rmtree(directory, ignore_errors=True)
                     upstream = transport_reference(image["source"]).rsplit("@", 1)[0]
-                    copy(f"docker://{upstream}@{image['transfer']}", f"dir:{directory}", "UPSTREAM")
+                    copy(f"docker://{upstream}@{image['transfer']}", f"dir:{directory}", side_of(upstream))
                 verify_image(directory, image["transfer"])
             if image["transfer"] != image["digest"]:
                 # Carry the approved index so import can check the platform image is listed in it.
-                index = run("skopeo", "inspect", "--raw", *options("UPSTREAM"),
+                index = run("skopeo", "inspect", "--raw", *options(side_of(image["source"])),
                             "docker://" + transport_reference(image["source"]))
                 (directory / f"{image['digest'][7:]}.manifest.json").write_bytes(index)
                 verify_platform(directory, image)
         write_json(stage / "images.json", metadata)
-        bundle = outbox / f"quay-{state['stream']}-{state['sequence']:012d}.tar"
+        bundle = outbox / f"mirror-{state['stream']}-{state['sequence']:012d}.tar"
         temporary_bundle = bundle.with_suffix(".tmp")
         with tarfile.open(temporary_bundle, "w") as archive:
             for item in sorted(stage.rglob("*")):
@@ -731,7 +738,7 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
     size = bundle.stat().st_size
     notify(bundle, kind)
     if os.environ.get("NIFI_URL"):
-        # Delivered: the images stay in low Quay and the record in the ledger, so nothing stays on the runner.
+        # Delivered: the images stay in the target registry and the record in the ledger, so nothing stays on the runner.
         for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
             path.unlink()
     if kind != "resend":  # a resend repeats what the ledger already records
@@ -761,18 +768,18 @@ def sequence_range(text, last):
     return first, final
 
 
-def export(since=None, sequences=None, image=None):
+def resend(since=None, sequences=None, image=None):
     """Resend recorded images as the next bundle: by date, by sequence or by target."""
     if not ledger_enabled():
-        raise MirrorError("export reads the ledger; set MIRROR_LEDGER=true")
+        raise MirrorError("resend reads the ledger; set MIRROR_LEDGER=true")
     if since and not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", since):
         raise MirrorError(f"--since {since!r}: expected YYYY-MM-DD")
     if not (since or sequences or image):
-        raise MirrorError("export needs --since, --sequence or --image")
+        raise MirrorError("resend needs --since, --sequence or --image")
     if not bundle_destination():
-        raise MirrorError("export writes a bundle; set NIFI_URL, or MIRROR_BUNDLE_DIR to hand-carry it")
-    low = registry("LOW_QUAY")
-    work = state_path("MIRROR_STATE_DIR", "quay-mirror")
+        raise MirrorError("resend writes a bundle; set NIFI_URL, or MIRROR_BUNDLE_DIR to hand-carry it")
+    low = registry("TARGET_REGISTRY")
+    work = state_path("MIRROR_STATE_DIR", "registry-mirror")
     with locked(work):
         state_file = work / "sent.json"
         state = load_state(state_file)
@@ -853,8 +860,8 @@ def validate_manifest(manifest):
 
 
 def import_one(bundle, adopt_stream=False, superseded_ok=False):
-    high = registry("HIGH_QUAY")
-    work = state_path("IMPORT_STATE_DIR", "quay-mirror-import")
+    high = registry("TARGET_REGISTRY")
+    work = state_path("IMPORT_STATE_DIR", "registry-mirror-import")
     sidecar = bundle.with_name(bundle.name + ".sha256")
     fields = sidecar.read_text().split() if sidecar.exists() else []
     digest = sha256(bundle)
@@ -885,22 +892,22 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
                 print(f"superseded: {bundle.name}")
                 return
             raise MirrorError("stale or conflicting bundle; refusing rollback")
-        # A resend from the low side's export stands in for every bundle from manifest["from"] on.
+        # A resend from the low side stands in for every bundle from manifest["from"] on.
         if (manifest["sequence"] != previous + 1 and not manifest["full"]
                 and manifest.get("from", previous + 2) > previous + 1):
             missing = (f"{previous + 1}" if manifest["sequence"] == previous + 2
                        else f"{previous + 1} to {manifest['sequence'] - 1}")
             raise SequenceGap(f"missing earlier bundle {missing} (imported up to {previous}, received "
                               f"{manifest['sequence']}); on the low side, Run pipeline with "
-                              f"EXPORT_SEQUENCE={previous + 1}.. (mirror.py export --sequence {previous + 1}..)")
+                              f"RESEND_SEQUENCE={previous + 1}.. (mirror.py resend --sequence {previous + 1}..)")
         for image in manifest["images"]:
             for tag in image["tags"]:
                 destination = f"docker://{high}/{image['target']}:{tag}"
                 copy(f"dir:{stage / 'images' / image['transfer'].replace(':', '-')}", destination,
-                     destination_side="HIGH_QUAY")
-                if raw_digest(destination, "HIGH_QUAY") != image["transfer"]:
+                     destination_side="TARGET_REGISTRY")
+                if raw_digest(destination, "TARGET_REGISTRY") != image["transfer"]:
                     raise MirrorError(f"high mirror digest mismatch: {image['target']}:{tag}")
-                print(f"pushed to high registry: {high}/{image['target']}:{tag}@{image['transfer']}")
+                print(f"pushed to target registry: {high}/{image['target']}:{tag}@{image['transfer']}")
         save_receipt(receipt_file, {"stream": manifest["stream"], "sequence": manifest["sequence"],
                                     "digest": digest, "registry": high})
     print(f"imported: {bundle.name} ({len(manifest['images'])} image(s), digests verified)")
@@ -915,7 +922,7 @@ def import_inbox(inbox, adopt_stream=False):
         os.replace(bundle, done / bundle.name)
 
     waiting = []
-    for bundle in sorted(inbox.glob("quay-*.tar")):
+    for bundle in sorted(inbox.glob("mirror-*.tar")):
         if not bundle.with_name(bundle.name + ".sha256").exists():
             print(f"waiting for checksum: {bundle.name}")
             continue
@@ -938,7 +945,7 @@ def import_registry(name=None, adopt_stream=False):
         # Checked before importing: a job token reads packages but GitLab refuses it a delete (HTTP 403).
         raise MirrorError("IMPORT_DELETE_BUNDLES with the package registry needs PACKAGE_TOKEN "
                           "(a project access token, role Maintainer, scope api)")
-    work = state_path("IMPORT_STATE_DIR", "quay-mirror-import")
+    work = state_path("IMPORT_STATE_DIR", "registry-mirror-import")
     downloads = work / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
 
@@ -966,7 +973,7 @@ def import_registry(name=None, adopt_stream=False):
     stream = receipt.get("stream") or (match[1].split("-")[1] if match else None)
     if stream:
         sequence = receipt.get("sequence", 0) + 1
-        while consume(f"quay-{stream}-{sequence:012d}", quiet=True):
+        while consume(f"mirror-{stream}-{sequence:012d}", quiet=True):
             sequence += 1
     if match:
         current = load_receipt(work / "received.json")
@@ -1011,7 +1018,7 @@ def references(files):
 
 
 def covers(path, files):
-    """Fail when a referenced image is neither in the catalog nor ever sent, upstream or high-side name."""
+    """Fail when a referenced image is neither in the catalog nor ever sent, by source or target name."""
     images = catalog(path)
     if ledger_enabled():
         state = load_state(Path(os.devnull))
@@ -1039,46 +1046,126 @@ def covers(path, files):
     print("every image is in the mirror catalog")
 
 
+# Hard cutover from the product-named variables; each maps to exactly one new name.
+RENAMED = {
+    "LOW_QUAY_HOST": "TARGET_REGISTRY", "HIGH_QUAY_HOST": "TARGET_REGISTRY",
+    "LOW_QUAY_USERNAME": "TARGET_REGISTRY_USERNAME", "HIGH_QUAY_USERNAME": "TARGET_REGISTRY_USERNAME",
+    "LOW_QUAY_PASSWORD": "TARGET_REGISTRY_PASSWORD", "HIGH_QUAY_PASSWORD": "TARGET_REGISTRY_PASSWORD",
+    "LOW_QUAY_TLS_VERIFY": "TARGET_REGISTRY_TLS_VERIFY", "HIGH_QUAY_TLS_VERIFY": "TARGET_REGISTRY_TLS_VERIFY",
+    "UPSTREAM_REGISTRY": "SOURCE_REGISTRY", "UPSTREAM_USERNAME": "SOURCE_REGISTRY_USERNAME",
+    "UPSTREAM_PASSWORD": "SOURCE_REGISTRY_PASSWORD", "UPSTREAM_TLS_VERIFY": "SOURCE_REGISTRY_TLS_VERIFY",
+    "EXPORT_SINCE": "RESEND_SINCE", "EXPORT_SEQUENCE": "RESEND_SEQUENCE", "EXPORT_IMAGE": "RESEND_IMAGE",
+    "MIRROR_FULL": "RESEND_ALL",
+}
+
+
+def check_renamed():
+    stale = sorted(f"{old} is now {new}" for old, new in RENAMED.items() if os.environ.get(old))
+    if stale:
+        raise MirrorError("renamed variables are set; rename them: " + "; ".join(stale))
+
+
+def login():
+    """skopeo login to TARGET_REGISTRY, and to SOURCE_REGISTRY when SOURCE_REGISTRY_USERNAME is set.
+
+    A registry without authentication needs no login: leave its USERNAME unset.
+    """
+    for side, default in (("TARGET_REGISTRY", None), ("SOURCE_REGISTRY", "docker.io")):
+        host = registry(side) if default is None else (os.environ.get(side) or default)
+        user = os.environ.get(f"{side}_USERNAME")
+        if not user:
+            continue
+        tls = "false" if os.environ.get(f"{side}_TLS_VERIFY") == "false" else "true"
+        result = subprocess.run(["skopeo", "login", f"--tls-verify={tls}", "--username", user, "--password-stdin", host],
+                                input=os.environ.get(f"{side}_PASSWORD", "").encode(), capture_output=True, check=False)
+        if result.returncode:
+            raise MirrorError(f"skopeo login {host} failed: {result.stderr.decode(errors='replace').strip()[-300:]}")
+        print(f"logged in to {host} as {user}")
+
+
+EXAMPLES = """
+Low side (pull from the source, save to your registry, send bundles):
+  TARGET_REGISTRY=registry.low.example.com mirror.py login
+  mirror.py add prom/prometheus:v3.13.4 team/prometheus
+  mirror.py sync                      # NIFI_URL set: bundle posted to NiFi
+  mirror.py resend --sequence 7..     # the high side reported bundle 7 missing
+
+High side (receive bundles, push to your registry):
+  TARGET_REGISTRY=registry.high.example.com mirror.py login
+  mirror.py import --registry --name mirror-<stream>-000000000008.tar
+  mirror.py import --inbox /transfer/in
+
+Run "mirror.py <command> -h" for each command's options and examples.
+"""
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--catalog", type=Path, default=ROOT / "images.txt")
+    raw = argparse.RawDescriptionHelpFormatter
+    parser = argparse.ArgumentParser(description=__doc__, epilog=EXAMPLES, formatter_class=raw)
+    parser.add_argument("--catalog", type=Path, default=ROOT / "images.txt", help="image catalog (default images.txt)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print every skopeo and curl command and each image decision (or MIRROR_VERBOSE=true)")
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("targets", help="validate and list the image catalog")
-    add = commands.add_parser("add", help="resolve a tag to its digest and append a reviewed catalog entry")
-    add.add_argument("source", help="[registry/]repository:tag, e.g. prom/prometheus:v3.13.4")
-    add.add_argument("target", help="Quay organisation/repository, any depth, e.g. team-dev/prom/prometheus")
-    low = commands.add_parser("sync", help="mirror to low Quay and export changed images")
-    low.add_argument("--full", action="store_true", help="export all approved images for recovery")
-    high = commands.add_parser("import", help="verify and push offline bundles to high Quay")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="command")
+
+    def command(name, summary, examples):
+        return commands.add_parser(name, help=summary, description=summary, epilog="examples:\n" + examples,
+                                   formatter_class=raw)
+
+    command("login", "log in to TARGET_REGISTRY, and SOURCE_REGISTRY when it has credentials",
+            "  TARGET_REGISTRY=registry.example.com TARGET_REGISTRY_USERNAME=robot \\\n"
+            "    TARGET_REGISTRY_PASSWORD=... mirror.py login\n"
+            "  SOURCE_REGISTRY_USERNAME=me SOURCE_REGISTRY_PASSWORD=... mirror.py login   # docker.io pulls")
+    command("targets", "validate and list the image catalog", "  mirror.py targets")
+    add = command("add", "resolve a tag to its digest and append a catalog entry",
+                  "  mirror.py add prom/prometheus:v3.13.4 team/prometheus\n"
+                  "  mirror.py add quay.io/prometheus/node-exporter:v1.9.1 team/node-exporter\n"
+                  "  mirror.py add bitnamicharts/redis:22.0.7 charts/redis   # an OCI Helm chart")
+    add.add_argument("source", help="[registry/]repository:tag, as for docker pull")
+    add.add_argument("target", help="repository path in TARGET_REGISTRY, any depth, e.g. team/prometheus")
+    sync_command = command("sync", "mirror the catalog into TARGET_REGISTRY and send what changed",
+                           "  mirror.py sync          # send changed images; NIFI_URL or MIRROR_BUNDLE_DIR receives\n"
+                           "  mirror.py sync --all    # send every approved image (recovery, RESEND_ALL=true in CI)")
+    sync_command.add_argument("--all", action="store_true", help="send every approved image, not only changes")
+    resend_command = command("resend", "resend recorded images as the next bundle (MIRROR_LEDGER=true)",
+                             "  mirror.py resend --sequence 7..        # bundles 7 to the newest (RESEND_SEQUENCE)\n"
+                             "  mirror.py resend --sequence 7..9\n"
+                             "  mirror.py resend --since 2026-10-01    # (RESEND_SINCE)\n"
+                             "  mirror.py resend --image team/prometheus:v3.13.4   # (RESEND_IMAGE)")
+    resend_command.add_argument("--since", help="images recorded on or after YYYY-MM-DD")
+    resend_command.add_argument("--sequence", help="bundles N, N.. (to the newest) or N..M")
+    resend_command.add_argument("--image", help="one target, repo or repo:tag")
+    command("pending", "list catalog sources the ledger has not sent yet, one per line", "  mirror.py pending")
+    check = command("covers", "fail when a Containerfile or manifest uses an image the mirror lacks",
+                    "  mirror.py covers Containerfile\n  helm template chart/ | mirror.py covers -")
+    check.add_argument("files", nargs="+", help="Containerfiles, manifests or - for rendered YAML on stdin")
+    high = command("import", "verify bundles and push their images to TARGET_REGISTRY",
+                   "  mirror.py import mirror-<stream>-000000000001.tar        # one bundle file\n"
+                   "  mirror.py import --inbox /transfer/in                  # every bundle in a directory\n"
+                   "  mirror.py import --registry --name mirror-<stream>-000000000008.tar\n"
+                   "      # from IMPORT_STORE (gitlab or s3), catching up on any missed bundle")
     selection = high.add_mutually_exclusive_group(required=True)
-    selection.add_argument("bundle", nargs="?", type=Path)
-    selection.add_argument("--inbox", type=Path)
+    selection.add_argument("bundle", nargs="?", type=Path, help="a bundle .tar, its .sha256 beside it")
+    selection.add_argument("--inbox", type=Path, help="a directory of bundles; imported ones move to done/")
     selection.add_argument("--registry", action="store_true",
-                           help="fetch bundles from this project's generic package registry")
+                           help="fetch bundles from IMPORT_STORE: the generic package registry or S3")
     high.add_argument("--name", help="with --registry: the bundle file a trigger announced (BUNDLE)")
     high.add_argument("--adopt-stream", action="store_true", help="accept a full bundle from a replacement sender")
-    resend = commands.add_parser("export", help="resend recorded images as the next bundle (MIRROR_LEDGER=true)")
-    resend.add_argument("--since", help="images recorded on or after YYYY-MM-DD")
-    resend.add_argument("--sequence", help="bundles N, N.. (to the newest) or N..M")
-    resend.add_argument("--image", help="one target, org/repo or org/repo:tag")
-    commands.add_parser("pending", help="list catalog sources the ledger has not sent yet, one per line")
-    check = commands.add_parser("covers", help="fail when a Containerfile or manifest uses an image the mirror lacks")
-    check.add_argument("files", nargs="+", help="Containerfiles, manifests or - for rendered YAML on stdin")
     args = parser.parse_args(argv)
     if args.verbose:
         os.environ["MIRROR_VERBOSE"] = "true"
     try:
-        if args.command == "targets":
+        check_renamed()
+        if args.command == "login":
+            login()
+        elif args.command == "targets":
             for image in catalog(args.catalog):
                 print(f"{image['source']} -> {image['target']}:{image['tag']}")
         elif args.command == "add":
             add_image(args.catalog, args.source, args.target)
         elif args.command == "sync":
-            sync(args.catalog, args.full)
-        elif args.command == "export":
-            export(args.since, args.sequence, args.image)
+            sync(args.catalog, args.all)
+        elif args.command == "resend":
+            resend(args.since, args.sequence, args.image)
         elif args.command == "pending":
             pending(args.catalog)
         elif args.command == "covers":

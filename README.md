@@ -1,123 +1,99 @@
-# gitlab-quay-mirror
+# gitlab-registry-mirror
 
-Mirrors reviewed images and Helm charts into low Quay and exports offline bundles for high Quay. [Quickstart](QUICKSTART.md).
+Mirrors reviewed container images and Helm charts into a registry on a connected low side, then carries them in verified bundles across a one-way link into a registry on an isolated high side. Any OCI registry works on either side: Quay, Harbor, GitLab, Artifactory, Nexus or `registry:2`. [Quickstart](QUICKSTART.md).
+
+Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` (`sync`), bundle to `NIFI_URL`, across the link, NiFi files it in `IMPORT_STORE`, then `import` pushes it to the high `TARGET_REGISTRY`. Each project sets `TARGET_REGISTRY` to its own side's registry.
 
 ## Requirements
 
-- Python 3.11+ and skopeo 1.13+ on each side; no Docker daemon or privileged runner.
-- GitLab with a runner that takes untagged jobs, or the one `MIRROR_JOB_TAG` names. `sync` and `export` need `python3`, `skopeo` and `curl` on it (the image on a Docker runner, the host on a shell runner).
-- For high-side import, a separate project with CI configuration path `.gitlab-ci-high.yml` and a runner chosen the same way, with `python3`, `skopeo` and `curl`.
-- For the hands-off path, NiFi 2.x on each side of the transfer link (`nifi/flow.py` builds both flows).
+- On each side's runner: `python3` 3.9+, `skopeo` 1.13+ and `curl`. In the job image on a Docker runner, on the host on a shell runner. No Docker daemon or privileged runner.
+- One GitLab project per side. The low project uses `.gitlab-ci.yml`; the high project sets **Settings > CI/CD > CI/CD configuration file** to `.gitlab-ci-high.yml`.
+- For the hands-off path, NiFi 2.x on each side of the link.
 
-## Inputs
+## Low side: pull, save, send
 
-`mirror.py --help`, `.gitlab-ci.yml` and `.gitlab-ci-high.yml` define the command and pipeline interfaces.
+`sync` copies each `images.txt` entry from its source into `TARGET_REGISTRY` by digest, then posts a bundle of what changed to `NIFI_URL`. Set these in **Settings > CI/CD > Variables**; mask the secrets and scope them to environment `mirror-low`.
 
 | Req | Name | Default | Purpose |
 |---|---|---|---|
-| For sync | `LOW_QUAY_HOST` | none | Low Quay, as `host[:port]` |
-| For import | `HIGH_QUAY_HOST` | none | High Quay, as `host[:port]` |
-| Optional | `MIRROR_PLATFORM` | all platforms | One platform to mirror and transfer, e.g. `linux/amd64` |
-| Optional | `MIRROR_LEDGER` | `true` in CI | Keep the sender ledger (low side) or import receipt (high side) in the project's generic package registry instead of a local file |
-| Optional | `GITLAB_API_URL`, `PACKAGE_PROJECT`, `PACKAGE_TOKEN` | the CI job's API, project and job token | Package registry for the ledger and for `import --registry` outside CI |
-| Optional | `MIRROR_STATE_DIR` | `~/.local/state/quay-mirror`; the job directory in CI | Work directory and, without the ledger, `sent.json`; one writer per directory |
-| Optional | `MIRROR_BUNDLE_DIR` | none | Directory that keeps bundles for hand-carry. With neither it nor `NIFI_URL`, `sync` mirrors to low Quay and writes no bundle |
-| Optional | `IMPORT_STATE_DIR` | `~/.local/state/quay-mirror-import`; the job directory in CI | Downloads and, without the ledger, `received.json` |
-| Optional | `MIRROR_SCAN` | `true` | `false` skips `sbom` and `scan`; `sync` then runs without them |
-| Optional | `MIRROR_JOB_TAG` | empty (untagged) | Runner tag for every job, low and high, for example `shell` |
-| In high CI | `IMPORT_INBOX_DIR` | none | Directory holding transferred archive/checksum pairs |
-| Optional | `IMPORT_STORE` | `gitlab` | Where NiFi files bundles and the receipt for `import --registry`: `gitlab` (generic package registry) or `s3` |
-| When `s3` | `S3_ENDPOINT`, `S3_BUCKET` | none | S3-compatible endpoint (`https://host:port`, path-style) and bucket |
-| Optional | `S3_REGION`, `S3_PREFIX` | `us-east-1`, empty | Signing region; key prefix before `quay-bundles/` and `quay-import-receipt/` |
-| Optional | `S3_CA_BUNDLE` | system roots | File variable with the store's CA, for a self-signed certificate. `S3_TLS_VERIFY=false` skips verification instead |
-| Optional | `IMPORT_DELETE_BUNDLES` | `false` | `true` deletes each bundle from the store once its images are pushed and verified |
-| Optional | `MIRROR_FULL` | `false` | Set `true` on Run pipeline to resend every approved image |
-| Optional | `EXPORT_SINCE`, `EXPORT_SEQUENCE`, `EXPORT_IMAGE` | none | On Run pipeline, resend instead of sync: `YYYY-MM-DD`, `N`, `N..` or `N..M`, `org/repo[:tag]` |
-| Optional | `SYFT_IMAGE`, `GRYPE_IMAGE` | `anchore/syft:v1.54.0-debug`, `anchore/grype:v0.120.0-debug` | SBOM and vulnerability scan of each pending image; debug variants, for their shell |
-| Optional | `GRYPE_FAIL_ON` | `critical` | Severity at which a fixed finding fails `scan`, blocking the merge and the sync |
-| Optional | `NIFI_URL` | none | NiFi ListenHTTP receiving both files by POST, with `Filename`, `X-Sha256`, `X-Artifact-Type: container-images`, `X-Artifact-Format` (`tar`, `sha256`), `X-Artifact-Action: mirror` and `X-Bundle-Kind` (`delta`, `full`, `resend`) |
-| Optional | `UPSTREAM_TLS_VERIFY`, `LOW_QUAY_TLS_VERIFY`, `HIGH_QUAY_TLS_VERIFY` | `true` | Set `false` only for an HTTP lab registry |
+| Required | `TARGET_REGISTRY` | none | Low registry, `host[:port]` |
+| Required | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account that can push; leave unset for a registry without auth |
+| Required | `NIFI_URL` | none | NiFi ListenHTTP the bundles are posted to |
+| Optional | `TARGET_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
+| Optional | `SOURCE_REGISTRY`, `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD`, `SOURCE_REGISTRY_TLS_VERIFY` | `docker.io`, none | Pull login, for example against Docker Hub rate limits |
+| Optional | `MIRROR_PLATFORM` | all platforms | One platform, for example `linux/amd64` |
+| Optional | `MIRROR_SCAN`, `GRYPE_FAIL_ON` | `true`, `critical` | Syft SBOM and Grype gate before `sync`; `false` skips both |
+| Optional | `SYFT_IMAGE`, `GRYPE_IMAGE` | `anchore/syft:v1.54.0-debug`, `anchore/grype:v0.120.0-debug` | Scanner images |
+| Optional | `MIRROR_BUNDLE_DIR` | none | Keep bundles in a directory for hand-carry instead of NiFi |
+| Run pipeline | `RESEND_ALL`, `RESEND_SEQUENCE`, `RESEND_SINCE`, `RESEND_IMAGE` | none | Recovery, see [Resend](#resend) |
 
-## Secrets
-
-`mirror.py` uses the credentials of `skopeo login` or `podman login`. Log in to each registry once; no auth-file variable is needed. A CI job has no `XDG_RUNTIME_DIR`, so the pipelines set `REGISTRY_AUTH_FILE` and log in from these protected, masked variables, scoped to environment `mirror-low` or `mirror-high`:
-
-| Variable | When | Purpose |
-|---|---|---|
-| `LOW_QUAY_USERNAME`, `LOW_QUAY_PASSWORD` | Sync | Robot with push/pull on the low target organisations |
-| `HIGH_QUAY_USERNAME`, `HIGH_QUAY_PASSWORD` | Import | Robot with push/pull on the high target organisations |
-| `UPSTREAM_USERNAME`, `UPSTREAM_PASSWORD`, `UPSTREAM_REGISTRY` | Rate-limited upstream | Pull credentials; registry defaults to `docker.io` |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | `IMPORT_STORE=s3` | Keys with get, put and delete on the bucket |
-| `PACKAGE_TOKEN` | `IMPORT_DELETE_BUNDLES` with `gitlab` | Project access token, role Maintainer, scope `api`: GitLab refuses the job token and Developers a package delete |
-
-## Minimum configuration
-
-Add each image by the tag you run. `add` looks up its current digest and appends a pinned line to `images.txt`. Destinations take any depth, and short names expand like `docker pull`.
+Add each image by the tag you run; `add` pins its current digest in `images.txt`:
 
 ```sh
-python3 mirror.py add prom/prometheus:v3.13.4 team-dev/prom/prometheus
-python3 mirror.py add bitnami/redis:latest team-dev/bitnami/redis
+python3 mirror.py add prom/prometheus:v3.13.4 team/prometheus
+python3 mirror.py add bitnami/redis:latest team/redis            # also tagged with the version it reports
+python3 mirror.py add bitnamicharts/redis:22.0.7 charts/redis    # an OCI Helm chart
+python3 mirror.py add registry.low.example.com/team/runner:1.2 team/runner   # your own image, already in TARGET_REGISTRY
 ```
 
-```text
-docker.io/prom/prometheus:v3.13.4@sha256:87861b8c... team-dev/prom/prometheus
-docker.io/bitnami/redis:latest@sha256:f4797b37... team-dev/bitnami/redis
-```
+A latest-only image also gets the version it reports, so `latest` can move while `8.10.2` stays. An image whose source is `TARGET_REGISTRY` itself is only verified there and sent, with that registry's login and TLS settings; no `SOURCE_REGISTRY` setting is needed. Renovate proposes updates as merge requests for the registries it can reach; `scan` must pass before one merges.
 
-| Image | Tags on low and high Quay | After Renovate's update merges |
-|---|---|---|
-| `prom/prometheus` (released tags) | `v3.13.4`, as on Docker Hub | `v3.15.0` added; `v3.13.4` stays |
-| `bitnami/redis` (publishes only `latest`) | `latest` and `8.10.2`, the version the image reports | `latest` moves to the new digest and its version tag is added; `8.10.2` stays |
+You know it works when the `sync` log shows `pushed to target registry: <host>/team/prometheus:v3.13.4@sha256:...` and `posted to NiFi: mirror-<stream>-<n>.tar -> <NIFI_URL> (HTTP 200, ...)`.
 
-Add an OCI Helm chart the same way: `python3 mirror.py add bitnamicharts/redis:22.0.7 team-dev/charts/redis`. A chart has no platform, so `MIRROR_PLATFORM` leaves it whole.
+## High side: receive, load, push
 
-The version comes from `org.opencontainers.image.version`, `app.kubernetes.io/version` or `APP_VERSION`. An image that reports none gets `latest` alone and is asked again on each sync; a failed lookup fails the run. `add` refuses signature and metadata artifacts such as bitnami's `sha256-<hex>` tags, which are not images.
+NiFi files each bundle in `IMPORT_STORE` and starts the pipeline with `BUNDLE`; `import` verifies every file against its digest and pushes the images to `TARGET_REGISTRY`. Scope the secrets to environment `mirror-high`. The NiFi steps are in `nifi/HIGH-SIDE-BY-HAND.md`; `nifi/flow.py --side high` builds the same flow.
 
-## Usage
+| Req | Name | Default | Purpose |
+|---|---|---|---|
+| Required | `TARGET_REGISTRY` | none | High registry, `host[:port]` |
+| Required | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account that can push; leave unset for a registry without auth |
+| Optional | `TARGET_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
+| Optional | `IMPORT_STORE` | `gitlab` | Where bundles wait: `gitlab` (this project's package registry) or `s3` |
+| When `s3` | `S3_ENDPOINT`, `S3_BUCKET` | none | `https://host:port` (path-style) and bucket |
+| When `s3` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | Get, put and delete on the bucket |
+| Optional | `S3_CA_BUNDLE`, `S3_REGION`, `S3_PREFIX`, `S3_TLS_VERIFY` | system CAs, `us-east-1`, none, `true` | `S3_CA_BUNDLE` is a File variable with a self-signed store's CA |
+| Optional | `IMPORT_DELETE_BUNDLES` | `false` | Delete each bundle from the store once imported |
+| When deleting from `gitlab` | `PACKAGE_TOKEN` | job token | Project access token, role Maintainer, scope `api`; GitLab refuses the job token a delete |
+| Optional | `IMPORT_INBOX_DIR` | none | Import hand-carried bundles from a directory instead of `IMPORT_STORE` |
 
-```sh
-python3 mirror.py sync
-```
+Give NiFi a project access token (Developer, scope `api`) and let Developers merge to the default branch: GitLab runs a pipeline on a protected branch only for a role that may merge to it. With S3, expire `registry-mirror-bundles/` by lifecycle rule if you like, never `registry-mirror-receipt/`.
+
+You know it works when the `import` log shows `pushed to target registry: <host>/team/prometheus:v3.13.4@sha256:...` and `imported: mirror-<stream>-<n>.tar (... digests verified)`. Pull that exact reference to confirm.
+
+## Both sides
+
+| Req | Name | Default | Purpose |
+|---|---|---|---|
+| Optional | `MIRROR_JOB_TAG` | empty (untagged) | Runner tag for every job, for example `shell` |
+| Optional | `CA_BUNDLE` | runner's `tls-ca-file` | Extra CA for the GitLab API |
+| Optional | `MIRROR_VERBOSE` | `false` | Print every skopeo and curl command |
+| Outside CI | `GITLAB_API_URL`, `PACKAGE_PROJECT`, `PACKAGE_TOKEN`, `MIRROR_LEDGER` | the job's values in CI | Package registry for the ledger and receipt |
+| Outside CI | `MIRROR_STATE_DIR`, `IMPORT_STATE_DIR` | `~/.local/state/registry-mirror[-import]` | Work directories |
+
+`python3 mirror.py -h` and `python3 mirror.py <command> -h` list every command with examples.
+
+## Resend
+
+The high side cannot ask for a bundle over a one-way link, so a lost one is resent from the low side. Import names it: `missing earlier bundle 7 to 8 (imported up to 6, received 9); on the low side, Run pipeline with RESEND_SEQUENCE=7..`. Run pipeline on the low project with that variable; `RESEND_SINCE=YYYY-MM-DD`, `RESEND_IMAGE=repo[:tag]` and `RESEND_ALL=true` work the same way. `docs/ledger.md` explains the ledger, the receipt and every recovery case.
 
 ## Preconditions
 
-- Create the target organisation on each Quay. Put its robot in a Creator team so new catalog repositories can be created, or pre-create repositories and grant the robot push/pull access.
-- Protect the default branch and mirror runner. Merge-request verification uses no mirror credentials or persistent state.
-- Enable Renovate on the GitLab copy. It proposes tag and digest updates to `images.txt` as merge requests; a person approves each one, and `scan` must pass first. Turn on **Pipelines must succeed** so a failed scan blocks the merge. `recreateWhen: always` reopens an update whenever `images.txt` still lacks it, even after its MR was closed or merged without the change (a conflict resolved in favour of the default branch); ignore an update with a `packageRules` entry, not by closing its MR. Let Renovate rebase a conflicted MR (the rebase checkbox, or its next run) rather than resolving the conflict by hand.
-- Create a nightly GitLab schedule against the protected default branch. Schedules mirror the reviewed catalog; they do not approve Renovate updates.
-- In CI nothing persists on a runner: the ledger, receipt, SBOMs and bundles' contents live in the package and container registries, and each job's work directory is removed when it ends. Outside CI without `MIRROR_LEDGER`, keep `MIRROR_STATE_DIR` and `IMPORT_STATE_DIR` between runs, one per low or high registry.
-- On a shell executor, `sbom` and `scan` start `SYFT_IMAGE` and `GRYPE_IMAGE` with `podman run`, so the runner user must be able to pull them (`podman login`, or public images). Grype's database goes in the job directory and needs about 2 GB free there while `scan` runs.
-- For `import --registry`, give the uploader a project access token on the high project (Developer, scope `api`) and let Developers merge to the default branch: GitLab runs a pipeline on a protected branch only for a role that may merge to it.
-- Let the `scan` runner reach Grype's vulnerability database (`grype.anchore.io`), or point `GRYPE_DB_UPDATE_URL` at a mirror of it.
-- Provision registry trust through the host's containers certificate configuration; keep TLS verification enabled outside disposable labs.
+- Each target registry has the repositories or a namespace the push account may create them in (a Quay Creator team, a Harbor project robot, a GitLab project's container registry, an Artifactory Docker repository).
+- Protect the default branch. Merge-request pipelines run the tests and scan without registry credentials.
+- Turn on **Pipelines must succeed** so a failed `scan` blocks the merge, and add a nightly schedule on the default branch.
+- The `scan` runner reaches `grype.anchore.io`, or `GRYPE_DB_UPDATE_URL` points at a mirror. On a shell runner `sbom` and `scan` run their images with `podman run` and need about 2 GB free in the build directory.
+- Quay refuses Windows manifests; set `MIRROR_PLATFORM` for images with Windows children such as `registry.k8s.io/pause`.
 
 ## Behaviour
 
-Default-branch catalog/script/pipeline changes, schedules and Run pipeline run sync after verification. `sync` and `export` run only where `LOW_QUAY_HOST` is set. A project without a low Quay runs the tests and scan only.
-Every sync verifies each tagged low-side copy, version tags included, restores any that is missing and copies new or changed approved digests; unchanged entries need no upstream pull.
-The ledger records the digest and version tags last sent for each destination tag, and only entries where either changed enter a bundle. With `MIRROR_LEDGER=true` it is generic package `quay-mirror-ledger`: `head/state.json`, plus `<sequence>/images.json` for every bundle with its creation time, so any runner can take the next run. Keep one writer at a time: in CI, `sync` and `export` share `resource_group: quay-mirror`; do not run either by hand against the same ledger meanwhile. A daily run with no change prints `nothing to send` and writes no bundle. A bundle that `NIFI_URL` accepted is deleted at once; without `NIFI_URL` it stays in `MIRROR_BUNDLE_DIR` for pickup. With neither set, `sync` updates low Quay, prints `not sent to the high side` and leaves the ledger unchanged, so the next run that has a destination sends those images; `export` refuses. `docs/ledger.md` walks through the ledger, sequences, resends and the receipt.
-`mirror.py pending` lists what the next sync sends: catalog entries the ledger has not sent at their current digest and platform. `sbom` writes a CycloneDX SBOM of each with Syft (`MIRROR_PLATFORM`, else `linux/amd64`), `scan` checks it with Grype (`--only-fixed`), and `sync` waits for `scan`. After a sync, each SBOM and Grype report is kept as generic package `quay-mirror-sbom`, version the image digest (`sha256-<hex>`). Charts hold no packages and have neither.
-`-v` (or `MIRROR_VERBOSE=true`) prints every skopeo and curl command and each unchanged entry; normal output prints one `send:` line per bundled image.
-With `MIRROR_PLATFORM` set, low Quay, the archive and high Quay hold only that platform's image: its digest is the one the index lists for that platform, not the index digest in `images.txt`. Where the index names no platforms, each child image's config decides. A signature, attestation or nested index is never selected, whatever platform it names. An image or index with no image for that platform fails sync before any copy. Changing it resends every image.
-Quay refuses Windows image manifests, so an all-platform mirror of an image with Windows children (such as `registry.k8s.io/pause`) fails. Set `MIRROR_PLATFORM` for it.
-
-Carry the `.tar` and matching `.sha256` together. Import checks the archive and every manifest, config and layer against its digest before pushing.
-`python3 mirror.py import --inbox /path/to/inbox` processes ready bundles in order and moves successful pairs to `done/`.
-Missing checksums wait; missing sequence numbers, conflicting replays and corrupt content fail.
-A missed transfer is recovered with `python3 mirror.py export --sequence N..` (N is the first missing bundle, which import names), `--since YYYY-MM-DD` or `--image org/repo[:tag]`. A resend is the next bundle and carries the newest recorded digest of each tag, copied from low Quay or, if gone, from upstream; one that covers every bundle from N on is accepted over the gap. `sync --full` resends everything; deleting sender state requires a reviewed full bundle and `import --adopt-stream`.
-
-Upload both files of a bundle to the high project's generic package `quay-bundles`, version the file name without `.tar`, then start a pipeline with `BUNDLE` set to the file name. `import --registry --name "$BUNDLE"` imports it and any earlier bundle whose pipeline never started; half a bundle waits for its other file.
-`nifi/flow.py --side low` builds ListenHTTP, PackageFlowFile and PutFile into the link, so the `X-` headers cross it. `--side high` lists the link, unpacks, routes on `X-Artifact-Type: container-images`, checks `X-Sha256`, and does both steps with a sensitive `gitlab.token`. `--store s3` uploads to the bucket with PutS3Object instead, trusting a self-signed store through a PEM CA parameter (`s3.ca=@ca.crt`). `nifi/QUAY-HIGH-BY-HAND.md` builds the high side by hand in the NiFi UI.
-
-For Helm workloads, render the chart with your actual values and add the resulting images; a chart version or `appVersion` does not list them all. `python3 mirror.py covers Containerfile k8s.yaml` (or `helm template ... | python3 mirror.py covers -`) fails when a `FROM` or `image:` reference is not in the catalog, by upstream or mirror name; with `MIRROR_LEDGER=true` every tag ever sent counts.
+- Nothing persists on a runner. The ledger (`registry-mirror-ledger`), SBOMs (`registry-mirror-sbom`) and receipt (`registry-mirror-receipt`) live in the package registry or the bucket; images live in the registries.
+- A bundle is recorded as sent only once NiFi accepted it or it was written to `MIRROR_BUNDLE_DIR`. With neither, `sync` updates the low registry and prints `not sent to the high side`.
+- `sync` and `resend` run only where `TARGET_REGISTRY` is set, so the source project runs the tests and scan only.
+- Import refuses a replayed older bundle and a gap in the sequence, and reports a duplicate trigger as `already imported`.
 
 ## Out of scope
 
-- Removing old tags, mirroring every upstream tag, Helm repositories served over HTTP, or deploying charts.
-- Detached signatures/referrers and cross-domain release approval; a checksum proves integrity, not sender authenticity. Images already sent are not rescanned.
-- Configuring the physical transfer link, GitLab schedules or Renovate service.
-
-## Expected result
-
-Sync prints one `send:` line per image and the bundle path, or `nothing to send; low-side digests verified`. Import prints one `pushed:` line per tag and `digests verified`.
-Verify the catalog at either end with `python3 mirror.py targets`.
+- Removing old tags, mirroring every source tag, or deploying charts.
+- Signatures and cross-domain approval: a checksum proves integrity, not who sent the bundle.
+- Configuring the transfer link, GitLab schedules or the Renovate service.

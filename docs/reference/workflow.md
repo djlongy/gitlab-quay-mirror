@@ -24,7 +24,7 @@ A bundle holds one skopeo `dir:` copy per image digest and `images.json`. An `oc
 
 The sender ledger records, per catalog tag, the digest sent and the version tags sent with a `latest` image. A version tag that appears later, for example after an upgrade or once the image reports one, enters the next delta. Every sync reads each low-side tag back, version tags included, and restores a missing one from the image already in low Quay.
 
-The sender reserves its sequence before publication. An interrupted export or failed HTTP delivery forces the next export to be full. The sender ledger records export, never proof of high-side receipt. A lost bundle therefore requires `sync --full`. A full bundle carries every current approved entry and may bridge a sequence gap.
+The sender reserves its sequence before publication. An interrupted run or failed HTTP delivery forces the next bundle to be full. The sender ledger records delivery to NiFi or a bundle directory, never proof of high-side receipt. A lost bundle therefore requires `resend --sequence N..` or `sync --all`. A full bundle carries every current approved entry and may bridge a sequence gap.
 
 Import validates every archive path, metadata entry, manifest, config and layer before any registry push. It then copies each image with digest preservation, reads the high-side manifests back and commits the receipt only after all pushes verify. A partially failed import can be retried. The registry may contain some completed copies, but no successful receipt is recorded prematurely.
 

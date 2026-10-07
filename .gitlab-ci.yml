@@ -17,11 +17,12 @@ variables:
   MIRROR_SCAN: 'true'
   # Runner tag for every job; empty sends them to any runner that takes untagged jobs.
   MIRROR_JOB_TAG: ''
-  MIRROR_FULL: 'false'
-  # Run pipeline with one of these set runs export instead of sync: YYYY-MM-DD, N / N.. / N..M, org/repo[:tag].
-  EXPORT_SINCE: ''
-  EXPORT_SEQUENCE: ''
-  EXPORT_IMAGE: ''
+  # Run pipeline with RESEND_ALL=true sends every approved image instead of only changes.
+  RESEND_ALL: 'false'
+  # Run pipeline with one of these set runs resend instead of sync: YYYY-MM-DD, N / N.. / N..M, repo[:tag].
+  RESEND_SINCE: ''
+  RESEND_SEQUENCE: ''
+  RESEND_IMAGE: ''
 
 verify:
   stage: verify
@@ -117,7 +118,7 @@ scan:
     paths: [sbom/]
     expire_in: 1 week
 
-# A protected shell runner with skopeo. Bundles go to NiFi and are deleted once it accepts them.
+# A runner with python3, skopeo and curl. Bundles go to NiFi and are deleted once it accepts them.
 # Merge-request validation runs elsewhere, without registry credentials.
 sync: &mirror
   stage: publish
@@ -125,7 +126,7 @@ sync: &mirror
     name: mirror-low
     action: prepare
   tags: [$MIRROR_JOB_TAG]
-  resource_group: quay-mirror
+  resource_group: registry-mirror
   needs:
     - job: verify
       artifacts: false
@@ -140,14 +141,10 @@ sync: &mirror
     # A CI job has no XDG_RUNTIME_DIR, so skopeo's default auth file is not writable.
     REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
   script:
-    - printf '%s' "$LOW_QUAY_PASSWORD" | skopeo login --tls-verify="${LOW_QUAY_TLS_VERIFY:-true}" --username "$LOW_QUAY_USERNAME" --password-stdin "$LOW_QUAY_HOST"
+    - python3 mirror.py login
     - |
-      if [ -n "${UPSTREAM_USERNAME:-}" ]; then
-        printf '%s' "$UPSTREAM_PASSWORD" | skopeo login --tls-verify="${UPSTREAM_TLS_VERIFY:-true}" --username "$UPSTREAM_USERNAME" --password-stdin "${UPSTREAM_REGISTRY:-docker.io}"
-      fi
-    - |
-      if [ "$MIRROR_FULL" = "true" ]; then
-        python3 mirror.py sync --full
+      if [ "$RESEND_ALL" = "true" ]; then
+        python3 mirror.py sync --all
       else
         python3 mirror.py sync
       fi
@@ -157,25 +154,27 @@ sync: &mirror
         [ -e "$file" ] || continue
         base=$(basename "$file"); version=${base%%.*}
         curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" \
-          "${GITLAB_API_URL:-$CI_API_V4_URL}/projects/$CI_PROJECT_ID/packages/generic/quay-mirror-sbom/$version/$base"
-        echo "kept: quay-mirror-sbom/$version/$base"
+          "${GITLAB_API_URL:-$CI_API_V4_URL}/projects/$CI_PROJECT_ID/packages/generic/registry-mirror-sbom/$version/$base"
+        echo "kept: registry-mirror-sbom/$version/$base"
       done
   after_script:
     - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/.mirror-work"
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never
-    # A project without a low Quay is the source repository, not a deployment: nothing to sync.
-    - if: '$LOW_QUAY_HOST == null'
+    # The pre-rename name still runs the job, so mirror.py fails and names TARGET_REGISTRY.
+    - if: '$LOW_QUAY_HOST != null && $LOW_QUAY_HOST != ""'
+    # A project without a target registry is the source repository, not a deployment: nothing to sync.
+    - if: '$TARGET_REGISTRY == null'
       when: never
-    - if: '$LOW_QUAY_HOST == ""'
+    - if: '$TARGET_REGISTRY == ""'
       when: never
     # One variable per rule: GitLab 18.9 evaluates `$A || $B` false when A is declared empty above.
-    - if: '$EXPORT_SINCE != null && $EXPORT_SINCE != ""'
+    - if: '$RESEND_SINCE != null && $RESEND_SINCE != ""'
       when: never
-    - if: '$EXPORT_SEQUENCE != null && $EXPORT_SEQUENCE != ""'
+    - if: '$RESEND_SEQUENCE != null && $RESEND_SEQUENCE != ""'
       when: never
-    - if: '$EXPORT_IMAGE != null && $EXPORT_IMAGE != ""'
+    - if: '$RESEND_IMAGE != null && $RESEND_IMAGE != ""'
       when: never
     - if: '$CI_PIPELINE_SOURCE =~ /^(schedule|web|api)$/'
     - if: '$CI_PIPELINE_SOURCE == "push"'
@@ -184,27 +183,25 @@ sync: &mirror
         - mirror.py
         - .gitlab-ci.yml
 
-# Run pipeline with EXPORT_SINCE, EXPORT_SEQUENCE or EXPORT_IMAGE resends recorded images as the next bundle.
-export:
+# Run pipeline with RESEND_SINCE, RESEND_SEQUENCE or RESEND_IMAGE resends recorded images as the next bundle.
+resend:
   <<: *mirror
   needs:
     - job: verify
       artifacts: false
   script:
-    - printf '%s' "$LOW_QUAY_PASSWORD" | skopeo login --tls-verify="${LOW_QUAY_TLS_VERIFY:-true}" --username "$LOW_QUAY_USERNAME" --password-stdin "$LOW_QUAY_HOST"
-    - |
-      if [ -n "${UPSTREAM_USERNAME:-}" ]; then
-        printf '%s' "$UPSTREAM_PASSWORD" | skopeo login --tls-verify="${UPSTREAM_TLS_VERIFY:-true}" --username "$UPSTREAM_USERNAME" --password-stdin "${UPSTREAM_REGISTRY:-docker.io}"
-      fi
-    - python3 mirror.py export ${EXPORT_SINCE:+--since "$EXPORT_SINCE"} ${EXPORT_SEQUENCE:+--sequence "$EXPORT_SEQUENCE"} ${EXPORT_IMAGE:+--image "$EXPORT_IMAGE"}
+    - python3 mirror.py login
+    - python3 mirror.py resend ${RESEND_SINCE:+--since "$RESEND_SINCE"} ${RESEND_SEQUENCE:+--sequence "$RESEND_SEQUENCE"} ${RESEND_IMAGE:+--image "$RESEND_IMAGE"}
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never
-    # A project without a low Quay is the source repository, not a deployment: nothing to sync.
-    - if: '$LOW_QUAY_HOST == null'
+    # The pre-rename name still runs the job, so mirror.py fails and names TARGET_REGISTRY.
+    - if: '$LOW_QUAY_HOST != null && $LOW_QUAY_HOST != ""'
+    # A project without a target registry is the source repository, not a deployment: nothing to sync.
+    - if: '$TARGET_REGISTRY == null'
       when: never
-    - if: '$LOW_QUAY_HOST == ""'
+    - if: '$TARGET_REGISTRY == ""'
       when: never
-    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $EXPORT_SINCE != null && $EXPORT_SINCE != ""'
-    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $EXPORT_SEQUENCE != null && $EXPORT_SEQUENCE != ""'
-    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $EXPORT_IMAGE != null && $EXPORT_IMAGE != ""'
+    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RESEND_SINCE != null && $RESEND_SINCE != ""'
+    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RESEND_SEQUENCE != null && $RESEND_SEQUENCE != ""'
+    - if: '$CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RESEND_IMAGE != null && $RESEND_IMAGE != ""'

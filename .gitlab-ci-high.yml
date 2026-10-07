@@ -1,6 +1,6 @@
 ---
 # Select this file as the CI configuration path in a separate high-side project.
-# NiFi uploads each bundle to this project's generic package registry, then starts a pipeline
+# NiFi uploads each bundle to IMPORT_STORE (this project's package registry, or S3), then starts a pipeline
 # through the API with BUNDLE set to the uploaded file name. A schedule catches up on any it missed.
 workflow:
   rules:
@@ -26,17 +26,17 @@ import:
   environment:
     name: mirror-high
     action: prepare
-  resource_group: quay-mirror-high
+  resource_group: registry-mirror-high
   needs:
     - job: verify
       artifacts: false
   variables:
-    # The receipt lives in this project's package registry and the downloads in the job directory.
+    # The receipt lives in IMPORT_STORE (package registry or S3) and the downloads in the job directory.
     MIRROR_LEDGER: 'true'
     IMPORT_STATE_DIR: '$CI_PROJECT_DIR/.import-work'
     REGISTRY_AUTH_FILE: $CI_PROJECT_DIR/.registry-auth.json
   script:
-    - printf '%s' "$HIGH_QUAY_PASSWORD" | skopeo login --tls-verify="${HIGH_QUAY_TLS_VERIFY:-true}" --username "$HIGH_QUAY_USERNAME" --password-stdin "$HIGH_QUAY_HOST"
+    - python3 mirror.py login
     - |
       if [ -n "${IMPORT_INBOX_DIR:-}" ]; then
         python3 mirror.py import --inbox "$IMPORT_INBOX_DIR"
