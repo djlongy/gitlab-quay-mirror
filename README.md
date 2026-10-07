@@ -42,7 +42,7 @@ You know it works when the `sync` log shows `pushed to target registry: <host>/t
 
 ## High side: receive, load, push
 
-NiFi files each bundle in `IMPORT_STORE` and starts the pipeline with `BUNDLE`; `import` verifies every file against its digest and pushes the images to `TARGET_REGISTRY`. Scope the secrets to environment `mirror-high`. The NiFi steps are in `nifi/HIGH-SIDE-BY-HAND.md`; `nifi/flow.py --side high` builds the same flow.
+NiFi files each bundle in `IMPORT_STORE` and starts the pipeline with `BUNDLE`; `import` verifies every file against its digest and pushes the images to `TARGET_REGISTRY`. Scope the secrets to environment `dev`. The NiFi steps are in `nifi/HIGH-SIDE-BY-HAND.md`; `nifi/flow.py --side high` builds the same flow.
 
 | Req | Name | Default | Purpose |
 |---|---|---|---|
@@ -60,6 +60,22 @@ NiFi files each bundle in `IMPORT_STORE` and starts the pipeline with `BUNDLE`; 
 Give NiFi a project access token (Developer, scope `api`) and let Developers merge to the default branch: GitLab runs a pipeline on a protected branch only for a role that may merge to it. With S3, expire `registry-mirror-bundles/` by lifecycle rule if you like, never `registry-mirror-receipt/`.
 
 You know it works when the `import` log shows `pushed to target registry: <host>/team/prometheus:v3.13.4@sha256:...` and `imported: mirror-<stream>-<n>.tar (... digests verified)`. Pull that exact reference to confirm.
+
+### Promote dev to prod
+
+With `MIRROR_PROMOTE=true`, the registry `import` pushes to is dev, and each pipeline ends in a manual `promote` job in environment `prod`. It copies exactly the images that pipeline imported, by digest, from dev to prod: `import --record imported.json` lists them and `mirror.py promote imported.json` copies them. The digest is checked in dev before the copy and in prod after it. Set these scoped to environment `prod`, protected and masked:
+
+| Req | Name | Purpose |
+|---|---|---|
+| Required | `SOURCE_REGISTRY` | Dev registry, `host[:port]`, the same value as the dev `TARGET_REGISTRY` |
+| Required | `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD` | Read access to dev; leave unset for a registry without auth |
+| Required | `TARGET_REGISTRY` | Prod registry, `host[:port]` |
+| Required | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | Account that can push to prod |
+| Optional | `SOURCE_REGISTRY_TLS_VERIFY`, `TARGET_REGISTRY_TLS_VERIFY` | `false` only for a plain-HTTP lab registry |
+
+Only users allowed to merge to the protected default branch can run `promote`, and the job page records who ran it. So allow only Maintainers to merge, and give NiFi's project access token the Maintainer role (that token can run `promote` too, so keep it in NiFi's sensitive parameters only). GitLab Free has no required approvers on an environment, so nothing stops a Maintainer approving their own change. A pipeline whose import pushed nothing shows `nothing to promote`. Running `promote` on an older pipeline copies its digests again, which is how to roll prod back while that pipeline's `imported.json` artifact lasts (90 days).
+
+Upgrading: the import job's environment was `mirror-high`. Rescope those variables to `dev`.
 
 ## Both sides
 

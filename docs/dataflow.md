@@ -153,6 +153,22 @@ receipt holds the stream, the last sequence imported and that bundle's checksum.
 
 A trigger for a bundle already imported logs `already imported` and pushes nothing.
 
+`import --record imported.json` writes the tags and digests this run pushed, and the job keeps
+the file as an artifact.
+
+### 9. Promote
+
+With `MIRROR_PROMOTE=true`, the import job runs in environment `dev` and the pipeline then
+waits on the manual `promote` job in environment `prod`. A user allowed to merge to the default
+branch runs it and confirms the prompt. `mirror.py promote imported.json` then, for each entry:
+
+1. Reads `SOURCE_REGISTRY/<path>@<digest>` (the dev registry) and checks the digest.
+2. Copies it to `TARGET_REGISTRY/<path>:<tag>` (the prod registry) with
+   `skopeo copy --all --preserve-digests`.
+3. Reads the prod manifest back, checks the digest and logs `promoted: ...`.
+
+It copies by digest, so a tag moved in dev after the import does not change what reaches prod.
+
 ## What the mirror never does
 
 - It never deletes a tag. Removing a catalog line stops future updates; existing tags remain
@@ -186,3 +202,4 @@ helm template chart/ -f values.yaml | python3 mirror.py covers -
 | `resend` | low | Rebuilds recorded images as the next bundle |
 | `covers` | low | Checks Containerfiles and manifests against the catalog |
 | `import` | high | Step 8, from `IMPORT_STORE`, a directory or one file |
+| `promote` | high | Step 9, dev to prod by digest |

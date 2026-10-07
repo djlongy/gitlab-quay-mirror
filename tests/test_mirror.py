@@ -251,9 +251,43 @@ class MirrorTest(unittest.TestCase):
             mirror.import_one(bundle)
         self.assertFalse((self.root / 'import/received.json').exists())
         with mock.patch.object(mirror, 'copy') as push, mock.patch.object(mirror, 'raw_digest', return_value=image['digest']):
-            mirror.import_one(bundle)
-            mirror.import_one(bundle)
+            record = self.root / 'imported.json'
+            record.write_text('[]\n')
+            mirror.import_one(bundle, record=record)
+            mirror.import_one(bundle, record=record)  # already imported: nothing new to record
         self.assertEqual(push.call_count, 1)
+        self.assertEqual(json.loads(record.read_text()),
+                         [{'target': image['target'], 'tag': tag, 'digest': image['transfer']} for tag in image['tags']])
+
+    def test_promote_copies_recorded_digests_from_dev_to_prod_and_verifies_both(self):
+        os.environ.update({'SOURCE_REGISTRY': 'dev.example.internal', 'TARGET_REGISTRY': 'prod.example.internal',
+                           'SOURCE_REGISTRY_TLS_VERIFY': 'false'})
+        old, new, other = ('sha256:' + c * 64 for c in 'abc')
+        record = self.root / 'imported.json'
+        record.write_text(json.dumps([{'target': 'team/app', 'tag': '1.0', 'digest': old},
+                                      {'target': 'team/app', 'tag': '1.0', 'digest': new},
+                                      {'target': 'team/db', 'tag': '2', 'digest': other}]))
+        digests = {'docker://dev.example.internal/team/app@' + new: new, 'docker://prod.example.internal/team/app:1.0': new,
+                   'docker://dev.example.internal/team/db@' + other: other, 'docker://prod.example.internal/team/db:2': other}
+        with mock.patch.object(mirror, 'copy') as copied, mock.patch('builtins.print'), \
+                mock.patch.object(mirror, 'raw_digest', side_effect=lambda ref, side: digests[ref]):
+            mirror.promote(record)
+        self.assertEqual([c.args for c in copied.call_args_list], [
+            ('docker://dev.example.internal/team/app@' + new, 'docker://prod.example.internal/team/app:1.0',
+             'SOURCE_REGISTRY', 'TARGET_REGISTRY'),
+            ('docker://dev.example.internal/team/db@' + other, 'docker://prod.example.internal/team/db:2',
+             'SOURCE_REGISTRY', 'TARGET_REGISTRY')])
+        digests['docker://prod.example.internal/team/db:2'] = old
+        with mock.patch.object(mirror, 'copy'), mock.patch('builtins.print'), \
+                mock.patch.object(mirror, 'raw_digest', side_effect=lambda ref, side: digests[ref]), \
+                self.assertRaisesRegex(mirror.MirrorError, 'digest mismatch in TARGET_REGISTRY after the copy'):
+            mirror.promote(record)
+        record.write_text(json.dumps([{'target': 'team/app', 'tag': '1.0', 'digest': 'latest'}]))
+        with self.assertRaisesRegex(mirror.MirrorError, 'invalid entry'):
+            mirror.promote(record)
+        os.environ['TARGET_REGISTRY'] = 'dev.example.internal'
+        with self.assertRaisesRegex(mirror.MirrorError, 'same registry'):
+            mirror.promote(record)
 
     def test_bundle_from_a_sender_without_version_tags_imports_its_catalog_tag(self):
         image, _ = fixture(self.stage)

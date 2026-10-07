@@ -866,7 +866,7 @@ def validate_manifest(manifest):
         seen.add(key)
 
 
-def import_one(bundle, adopt_stream=False, superseded_ok=False):
+def import_one(bundle, adopt_stream=False, superseded_ok=False, record=None):
     high = registry("TARGET_REGISTRY")
     work = state_path("IMPORT_STATE_DIR", "registry-mirror-import")
     sidecar = bundle.with_name(bundle.name + ".sha256")
@@ -907,6 +907,7 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
             raise SequenceGap(f"missing earlier bundle {missing} (imported up to {previous}, received "
                               f"{manifest['sequence']}); on the low side, Run pipeline with "
                               f"RESEND_SEQUENCE={previous + 1}.. (mirror.py resend --sequence {previous + 1}..)")
+        pushed = []
         for image in manifest["images"]:
             for tag in image["tags"]:
                 destination = f"docker://{high}/{image['target']}:{tag}"
@@ -915,14 +916,17 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False):
                 if raw_digest(destination, "TARGET_REGISTRY") != image["transfer"]:
                     raise MirrorError(f"high mirror digest mismatch: {image['target']}:{tag}")
                 print(f"pushed to target registry: {high}/{image['target']}:{tag}@{image['transfer']}")
+                pushed.append({"target": image["target"], "tag": tag, "digest": image["transfer"]})
+        if record:
+            record.write_text(json.dumps(json.loads(record.read_text()) + pushed, indent=2) + "\n")
         save_receipt(receipt_file, {"stream": manifest["stream"], "sequence": manifest["sequence"],
                                     "digest": digest, "registry": high})
     print(f"imported: {bundle.name} ({len(manifest['images'])} image(s), digests verified)")
 
 
-def import_inbox(inbox, adopt_stream=False):
+def import_inbox(inbox, adopt_stream=False, record=None):
     def consume(bundle):
-        import_one(bundle, adopt_stream, superseded_ok=True)
+        import_one(bundle, adopt_stream, superseded_ok=True, record=record)
         done = inbox / "done"
         done.mkdir(exist_ok=True)
         os.replace(bundle.with_name(bundle.name + ".sha256"), done / (bundle.name + ".sha256"))
@@ -942,7 +946,7 @@ def import_inbox(inbox, adopt_stream=False):
         consume(bundle)
 
 
-def import_registry(name=None, adopt_stream=False):
+def import_registry(name=None, adopt_stream=False, record=None):
     """Import bundles NiFi uploaded to IMPORT_STORE (the generic package registry or S3), oldest first.
 
     name is the file a trigger announces. The receipt names the next sequence, so bundles
@@ -963,7 +967,7 @@ def import_registry(name=None, adopt_stream=False):
                 if not quiet:
                     print(f"waiting for {path.name}")
                 return False
-        import_one(bundle, adopt_stream, superseded_ok=True)
+        import_one(bundle, adopt_stream, superseded_ok=True, record=record)
         for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
             path.unlink()
         if os.environ.get("IMPORT_DELETE_BUNDLES") == "true":
@@ -991,6 +995,36 @@ def import_registry(name=None, adopt_stream=False):
             print(f"{done}: {match[1]}.tar")
         else:
             consume(match[1])
+
+
+def promote(record):
+    """Copy the images an import recorded from SOURCE_REGISTRY (dev) to TARGET_REGISTRY (prod), by digest.
+
+    The digest is checked in dev before the copy and in prod after it, so prod holds the bytes
+    that were imported and approved, whatever the dev tags point at by now.
+    """
+    dev, prod = registry("SOURCE_REGISTRY"), registry("TARGET_REGISTRY")
+    if dev == prod:
+        raise MirrorError("SOURCE_REGISTRY and TARGET_REGISTRY are the same registry; nothing to promote")
+    images = {}
+    for entry in json.loads(record.read_text()):
+        if (not isinstance(entry, dict) or not TARGET.fullmatch(str(entry.get("target")))
+                or not re.fullmatch(TAG, str(entry.get("tag"))) or not re.fullmatch(DIGEST, str(entry.get("digest")))):
+            raise MirrorError(f"{record}: invalid entry {entry!r}")
+        images[f"{entry['target']}:{entry['tag']}"] = entry  # a later bundle's digest for the same tag wins
+    if not images:
+        print(f"nothing to promote: {record} lists no images")
+        return
+    for key, entry in images.items():
+        source = f"docker://{dev}/{entry['target']}@{entry['digest']}"
+        if raw_digest(source, "SOURCE_REGISTRY") != entry["digest"]:
+            raise MirrorError(f"digest mismatch in SOURCE_REGISTRY: {dev}/{entry['target']}@{entry['digest']}")
+        destination = f"docker://{prod}/{key}"
+        copy(source, destination, "SOURCE_REGISTRY", "TARGET_REGISTRY")
+        if raw_digest(destination, "TARGET_REGISTRY") != entry["digest"]:
+            raise MirrorError(f"digest mismatch in TARGET_REGISTRY after the copy: {prod}/{key}")
+        print(f"promoted: {dev}/{entry['target']}@{entry['digest']} -> {prod}/{key}")
+    print(f"promoted {len(images)} image tag(s) from {dev} to {prod}, digests verified")
 
 
 def pending(path):
@@ -1097,10 +1131,11 @@ Low side (pull from the source, save to your registry, send bundles):
   mirror.py sync                      # NIFI_URL set: bundle posted to NiFi
   mirror.py resend --sequence 7..     # the high side reported bundle 7 missing
 
-High side (receive bundles, push to your registry):
+High side (receive bundles, push to your registry, promote dev to prod):
   TARGET_REGISTRY=registry.high.example.com mirror.py login
-  mirror.py import --registry --name mirror-<stream>-000000000008.tar
+  mirror.py import --registry --name mirror-<stream>-000000000008.tar --record imported.json
   mirror.py import --inbox /transfer/in
+  SOURCE_REGISTRY=registry.dev.example.com TARGET_REGISTRY=registry.prod.example.com mirror.py promote imported.json
 
 Run "mirror.py <command> -h" for each command's options and examples.
 """
@@ -1157,6 +1192,11 @@ def main(argv=None):
                            help="fetch bundles from IMPORT_STORE: the generic package registry or S3")
     high.add_argument("--name", help="with --registry: the bundle file a trigger announced (BUNDLE)")
     high.add_argument("--adopt-stream", action="store_true", help="accept a full bundle from a replacement sender")
+    high.add_argument("--record", type=Path, help="write the image tags and digests this run pushed, for promote")
+    promote_command = command("promote", "copy recorded images from SOURCE_REGISTRY (dev) to TARGET_REGISTRY (prod) by digest",
+                              "  SOURCE_REGISTRY=registry.dev.example.com TARGET_REGISTRY=registry.prod.example.com \\\n"
+                              "    mirror.py promote imported.json      # the file import --record wrote")
+    promote_command.add_argument("record", type=Path, help="the file import --record wrote")
     args = parser.parse_args(argv)
     if args.verbose:
         os.environ["MIRROR_VERBOSE"] = "true"
@@ -1177,12 +1217,17 @@ def main(argv=None):
             pending(args.catalog)
         elif args.command == "covers":
             covers(args.catalog, args.files)
-        elif args.registry:
-            import_registry(args.name, args.adopt_stream)
-        elif args.inbox:
-            import_inbox(args.inbox, args.adopt_stream)
+        elif args.command == "promote":
+            promote(args.record)
         else:
-            import_one(args.bundle, args.adopt_stream)
+            if args.record:
+                args.record.write_text("[]\n")  # this run's pushes only; nothing new leaves an empty list
+            if args.registry:
+                import_registry(args.name, args.adopt_stream, args.record)
+            elif args.inbox:
+                import_inbox(args.inbox, args.adopt_stream, args.record)
+            else:
+                import_one(args.bundle, args.adopt_stream, record=args.record)
         return 0
     except (MirrorError, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
         print(f"error: {error}", file=sys.stderr)

@@ -27,7 +27,7 @@ the digest the low side approved. `skopeo copy --preserve-digests` keeps it, and
   pipelines > CI/CD configuration file** set to `.gitlab-ci-high.yml`.
 - A runner that takes untagged jobs (or the one `MIRROR_JOB_TAG` names) with `python3` (3.9 or later), `skopeo`
   and `curl`.
-- Project CI/CD variables, protected and masked, scoped to environment `mirror-high`:
+- Project CI/CD variables, protected and masked, scoped to environment `dev`:
 
   | Variable | Value |
   |---|---|
@@ -35,7 +35,8 @@ the digest the low side approved. `skopeo copy --preserve-digests` keeps it, and
   | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | an account that can push. Leave unset for a registry without auth |
   | `TARGET_REGISTRY_TLS_VERIFY` | `false` only for a plain-HTTP registry |
 
-- A project access token for NiFi: role **Developer**, scope **api**.
+- A project access token for NiFi: role **Developer**, scope **api** (role **Maintainer** with
+  `MIRROR_PROMOTE=true`, where only Maintainers may merge; see the README's "Promote dev to prod").
 - **Settings > Repository > Protected branches**: allow **Developers + Maintainers** to
   merge to the default branch. GitLab runs a pipeline on a protected branch only for a
   role that may merge to it, and refuses the token's pipeline request otherwise.
