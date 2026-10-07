@@ -146,6 +146,41 @@ If GitLab uses an internal CA, set **SSL Context Service** to a
 StandardSSLContextService whose truststore holds it. For bundles of several GB, raise
 **Socket Write Timeout** and **Socket Read Timeout**, for example to `30 mins`.
 
+### 4 (S3 instead). Upload to S3
+
+With `IMPORT_STORE=s3` on the high project, build this in place of **Upload to GitLab**.
+Add three parameters to the context first: `s3.access_key` and `s3.secret_key`, both
+**Sensitive: Yes**, and `s3.ca`, the store's CA certificate in PEM, pasted whole.
+
+Two controller services, from the process group's **Configure > Controller Services > +**.
+Enable each with the lightning icon once set.
+
+| Service | Property | Value |
+|---|---|---|
+| AWSCredentialsProviderControllerService, named `S3 credentials` | Access Key ID | `#{s3.access_key}` |
+| | Secret Access Key | `#{s3.secret_key}` |
+| PEMEncodedSSLContextProvider, named `S3 CA` | Private Key Source | `UNDEFINED` |
+| | Certificate Authorities Source | `PROPERTIES` |
+| | Certificate Authorities | `#{s3.ca}` |
+
+Then the processor. Type **PutS3Object**.
+
+| Property | Value |
+|---|---|
+| Bucket | the bucket name |
+| Object Key | `quay-bundles/${filename:substringBefore('.tar')}/${filename}`, with the project's `S3_PREFIX` and a `/` in front when it sets one |
+| Region | `us-east-1`, or the store's region |
+| AWS Credentials Provider Service | `S3 credentials` |
+| SSL Context Service | `S3 CA` |
+| Endpoint Override URL | `https://<store>:<port>` |
+| Use Path Style Access | `true` |
+
+Auto-terminate: none. In Part 4, connect `success` to **Start the import pipeline** and
+`failure` to **Rejected (inspect queue)**, in place of rows 7 to 9.
+
+Give the bucket a lifecycle rule that expires `quay-bundles/` after a few days, or set
+`IMPORT_DELETE_BUNDLES=true` on the high project. Never expire `quay-import-receipt/`.
+
 ### 5. Start the import pipeline
 
 Type **InvokeHTTP**.

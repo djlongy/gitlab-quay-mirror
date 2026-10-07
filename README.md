@@ -26,6 +26,11 @@ Mirrors reviewed images and Helm charts into low Quay and exports offline bundle
 | Optional | `MIRROR_SCAN` | `true` | `false` skips `sbom` and `scan`; `sync` then runs without them |
 | Optional | `MIRROR_JOB_TAG` | empty (untagged) | Runner tag for every job, low and high, for example `shell` |
 | In high CI | `IMPORT_INBOX_DIR` | none | Directory holding transferred archive/checksum pairs |
+| Optional | `IMPORT_STORE` | `gitlab` | Where NiFi files bundles and the receipt for `import --registry`: `gitlab` (generic package registry) or `s3` |
+| When `s3` | `S3_ENDPOINT`, `S3_BUCKET` | none | S3-compatible endpoint (`https://host:port`, path-style) and bucket |
+| Optional | `S3_REGION`, `S3_PREFIX` | `us-east-1`, empty | Signing region; key prefix before `quay-bundles/` and `quay-import-receipt/` |
+| Optional | `S3_CA_BUNDLE` | system roots | File variable with the store's CA, for a self-signed certificate. `S3_TLS_VERIFY=false` skips verification instead |
+| Optional | `IMPORT_DELETE_BUNDLES` | `false` | `true` deletes each bundle from the store once its images are pushed and verified |
 | Optional | `MIRROR_FULL` | `false` | Set `true` on Run pipeline to resend every approved image |
 | Optional | `EXPORT_SINCE`, `EXPORT_SEQUENCE`, `EXPORT_IMAGE` | none | On Run pipeline, resend instead of sync: `YYYY-MM-DD`, `N`, `N..` or `N..M`, `org/repo[:tag]` |
 | Optional | `SYFT_IMAGE`, `GRYPE_IMAGE` | `anchore/syft:v1.54.0-debug`, `anchore/grype:v0.120.0-debug` | SBOM and vulnerability scan of each pending image; debug variants, for their shell |
@@ -42,6 +47,8 @@ Mirrors reviewed images and Helm charts into low Quay and exports offline bundle
 | `LOW_QUAY_USERNAME`, `LOW_QUAY_PASSWORD` | Sync | Robot with push/pull on the low target organisations |
 | `HIGH_QUAY_USERNAME`, `HIGH_QUAY_PASSWORD` | Import | Robot with push/pull on the high target organisations |
 | `UPSTREAM_USERNAME`, `UPSTREAM_PASSWORD`, `UPSTREAM_REGISTRY` | Rate-limited upstream | Pull credentials; registry defaults to `docker.io` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | `IMPORT_STORE=s3` | Keys with get, put and delete on the bucket |
+| `PACKAGE_TOKEN` | `IMPORT_DELETE_BUNDLES` with `gitlab` | Project access token, role Maintainer, scope `api`: GitLab refuses the job token and Developers a package delete |
 
 ## Minimum configuration
 
@@ -100,7 +107,7 @@ Missing checksums wait; missing sequence numbers, conflicting replays and corrup
 A missed transfer is recovered with `python3 mirror.py export --sequence N..` (N is the first missing bundle, which import names), `--since YYYY-MM-DD` or `--image org/repo[:tag]`. A resend is the next bundle and carries the newest recorded digest of each tag, copied from low Quay or, if gone, from upstream; one that covers every bundle from N on is accepted over the gap. `sync --full` resends everything; deleting sender state requires a reviewed full bundle and `import --adopt-stream`.
 
 Upload both files of a bundle to the high project's generic package `quay-bundles`, version the file name without `.tar`, then start a pipeline with `BUNDLE` set to the file name. `import --registry --name "$BUNDLE"` imports it and any earlier bundle whose pipeline never started; half a bundle waits for its other file.
-`nifi/flow.py --side low` builds ListenHTTP, PackageFlowFile and PutFile into the link, so the `X-` headers cross it. `--side high` lists the link, unpacks, routes on `X-Artifact-Type: container-images`, checks `X-Sha256`, and does both steps with a sensitive `gitlab.token`. `nifi/QUAY-HIGH-BY-HAND.md` builds the high side by hand in the NiFi UI.
+`nifi/flow.py --side low` builds ListenHTTP, PackageFlowFile and PutFile into the link, so the `X-` headers cross it. `--side high` lists the link, unpacks, routes on `X-Artifact-Type: container-images`, checks `X-Sha256`, and does both steps with a sensitive `gitlab.token`. `--store s3` uploads to the bucket with PutS3Object instead, trusting a self-signed store through a PEM CA parameter (`s3.ca=@ca.crt`). `nifi/QUAY-HIGH-BY-HAND.md` builds the high side by hand in the NiFi UI.
 
 For Helm workloads, render the chart with your actual values and add the resulting images; a chart version or `appVersion` does not list them all. `python3 mirror.py covers Containerfile k8s.yaml` (or `helm template ... | python3 mirror.py covers -`) fails when a `FROM` or `image:` reference is not in the catalog, by upstream or mirror name; with `MIRROR_LEDGER=true` every tag ever sent counts.
 
