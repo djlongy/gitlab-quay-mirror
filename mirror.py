@@ -122,6 +122,31 @@ def catalog(path):
     return images
 
 
+def flag(name):
+    """A true/false setting. Anything else is an error, so a typo cannot read as off."""
+    value = os.environ.get(name, "").strip()
+    if value.lower() not in ("", "true", "false"):
+        raise MirrorError(f"{name} must be true or false, not {value!r}")
+    return value.lower() == "true"
+
+
+def settings(*entries):
+    """Print each setting a command reads, and what leaving it unset means. A variable that never
+    reaches the job, such as one scoped to another CI environment, shows here instead of silently
+    changing behaviour."""
+    environment = os.environ.get("CI_ENVIRONMENT_NAME")
+    where = f" in this job (environment {environment})" if environment else ""
+    for name, unset, secret in entries:
+        value = os.environ.get(name, "").strip()
+        if value:
+            if "://" in value:  # a URL may carry credentials, as NIFI_URL can
+                parts = urllib.parse.urlsplit(value)
+                value = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()
+            print(f"setting: {name}={'(set)' if secret else value}")
+        else:
+            print(f"setting: {name} is not set{where}: {unset}")
+
+
 def say(message):
     if os.environ.get("MIRROR_VERBOSE") == "true":
         print(message, file=sys.stderr, flush=True)
@@ -332,18 +357,23 @@ def store_put(package, version, name, data):
 
 
 def store_delete(package, version, names):
-    """Remove an imported bundle: its objects in the bucket, or its generic package version."""
+    """Remove an imported bundle: its objects in the bucket, or its generic package version.
+    Returns how many generic packages were deleted; S3 does not report a missing object."""
     try:
         if s3_enabled():
             for name in names:
                 s3_request("DELETE", f"{package}/{version}/{name}").close()
-            return
+            return len(names)
         base, (key, value) = packages()
-        query = urllib.parse.urlencode({"package_type": "generic", "package_name": package, "package_version": version})
+        query = urllib.parse.urlencode({"package_type": "generic", "package_name": package,
+                                        "package_version": version, "per_page": 100})
         listing = base.rsplit("/generic", 1)[0]
+        deleted = 0
         for found in json.loads(package_api("GET", f"{listing}?{query}", key, value)):
             if found["name"] == package and found["version"] == version:
                 package_api("DELETE", f"{listing}/{found['id']}", key, value)
+                deleted += 1
+        return deleted
     except urllib.error.URLError as error:
         raise MirrorError(f"delete {package}/{version}: {getattr(error, 'code', error.reason)}") from error
 
@@ -597,6 +627,10 @@ def notify(bundle, kind):
 
 def sync(path, full=False):
     low = registry("TARGET_REGISTRY")
+    settings(("NIFI_URL", "bundles are not posted to NiFi", False),
+             ("MIRROR_BUNDLE_DIR", "bundles are not kept for hand-carry", False),
+             ("MIRROR_LEDGER", "what was sent is kept only in MIRROR_STATE_DIR, which a CI job does not keep", False),
+             ("MIRROR_PLATFORM", "every platform of each image is sent", False))
     images = catalog(path)
     if not images:
         raise MirrorError("catalog is empty; add an image before syncing")
@@ -952,13 +986,31 @@ def import_registry(name=None, adopt_stream=False, record=None):
     name is the file a trigger announces. The receipt names the next sequence, so bundles
     whose trigger never arrived are fetched too. A bundle missing either file waits.
     """
-    if os.environ.get("IMPORT_DELETE_BUNDLES") == "true" and not s3_enabled() and not os.environ.get("PACKAGE_TOKEN"):
+    cleanup = flag("IMPORT_DELETE_BUNDLES")
+    settings(("IMPORT_STORE", "bundles are read from this project's package registry (gitlab)", False),
+             ("MIRROR_LEDGER", "the receipt is kept only in IMPORT_STATE_DIR, which a CI job does not keep", False),
+             ("IMPORT_DELETE_BUNDLES", "imported bundles stay in the store", False),
+             ("PACKAGE_TOKEN", "the job token is used; GitLab refuses it a package delete", True))
+    if cleanup and not s3_enabled() and not os.environ.get("PACKAGE_TOKEN"):
         # Checked before importing: a job token reads packages but GitLab refuses it a delete (HTTP 403).
         raise MirrorError("IMPORT_DELETE_BUNDLES with the package registry needs PACKAGE_TOKEN "
                           "(a project access token, role Maintainer, scope api)")
     work = state_path("IMPORT_STATE_DIR", "registry-mirror-import")
     downloads = work / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
+
+    removed = set()
+
+    def remove(stem):
+        if stem in removed:
+            return
+        removed.add(stem)
+        if not cleanup:
+            print(f"kept in the store: {stem} (IMPORT_DELETE_BUNDLES is not true)")
+        elif store_delete(BUNDLES, stem, [f"{stem}.tar", f"{stem}.tar.sha256"]):
+            print(f"deleted from the store: {stem}")
+        else:
+            print(f"nothing to delete in the store: {stem}")
 
     def consume(stem, quiet=False):
         bundle = downloads / f"{stem}.tar"
@@ -970,10 +1022,7 @@ def import_registry(name=None, adopt_stream=False, record=None):
         import_one(bundle, adopt_stream, superseded_ok=True, record=record)
         for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
             path.unlink()
-        if os.environ.get("IMPORT_DELETE_BUNDLES") == "true":
-            # Its images are in the high registry and the receipt has moved past it.
-            store_delete(BUNDLES, stem, [f"{stem}.tar", f"{stem}.tar.sha256"])
-            print(f"deleted from the store: {stem}")
+        remove(stem)  # its images are in the target registry and the receipt has moved past it
         return True
 
     match = BUNDLE_NAME.fullmatch(name or "")
@@ -993,6 +1042,10 @@ def import_registry(name=None, adopt_stream=False, record=None):
             # Imported already, by an earlier trigger or the catch-up above; its files may be gone.
             done = "already imported" if stem_sequence == current.get("sequence") else "superseded"
             print(f"{done}: {match[1]}.tar")
+            if cleanup:  # left behind by a run that imported it without cleanup
+                remove(match[1])
+            else:
+                print(f"not checking the store for {match[1]}: IMPORT_DELETE_BUNDLES is not true")
         else:
             consume(match[1])
 

@@ -53,7 +53,7 @@ NiFi files each bundle in `IMPORT_STORE` and starts the pipeline with `BUNDLE`; 
 | When `s3` | `S3_ENDPOINT`, `S3_BUCKET` | none | `https://host:port` (path-style) and bucket |
 | When `s3` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | Get, put and delete on the bucket |
 | Optional | `S3_CA_BUNDLE`, `S3_REGION`, `S3_PREFIX`, `S3_TLS_VERIFY` | system CAs, `us-east-1`, none, `true` | `S3_CA_BUNDLE` is a File variable with a self-signed store's CA |
-| Optional | `IMPORT_DELETE_BUNDLES` | `false` | Delete each bundle from the store once imported |
+| Optional | `IMPORT_DELETE_BUNDLES` | `false` | `true` deletes each bundle from the store once imported; a re-trigger removes one an earlier run left |
 | When deleting from `gitlab` | `PACKAGE_TOKEN` | job token | Project access token, role Maintainer, scope `api`; GitLab refuses the job token a delete |
 | Optional | `IMPORT_INBOX_DIR` | none | Import hand-carried bundles from a directory instead of `IMPORT_STORE` |
 
@@ -63,7 +63,7 @@ You know it works when the `import` log shows `pushed to target registry: <host>
 
 ### Promote dev to prod
 
-With `MIRROR_PROMOTE=true`, the registry `import` pushes to is dev, and each pipeline ends in a manual `promote` job in environment `prod`. It copies exactly the images that pipeline imported, by digest, from dev to prod: `import --record imported.json` lists them and `mirror.py promote imported.json` copies them. The digest is checked in dev before the copy and in prod after it. Set these scoped to environment `prod`, protected and masked:
+With `MIRROR_PROMOTE=true`, the registry `import` pushes to is dev, and each pipeline ends in a manual `promote` job in environment `prod`: a play button in the pipeline's `promote` stage, and the pipeline shows as blocked until someone runs it. `MIRROR_PROMOTE` may be unscoped or scoped to `prod`; without it the pipeline has no `promote` stage. It copies exactly the images that pipeline imported, by digest, from dev to prod: `import --record imported.json` lists them and `mirror.py promote imported.json` copies them. The digest is checked in dev before the copy and in prod after it. Set these scoped to environment `prod`, protected and masked:
 
 | Req | Name | Purpose |
 |---|---|---|
@@ -75,7 +75,9 @@ With `MIRROR_PROMOTE=true`, the registry `import` pushes to is dev, and each pip
 
 Only users allowed to merge to the protected default branch can run `promote`, and the job page records who ran it. So allow only Maintainers to merge, and give NiFi's project access token the Maintainer role (that token can run `promote` too, so keep it in NiFi's sensitive parameters only). GitLab Free has no required approvers on an environment, so nothing stops a Maintainer approving their own change. A pipeline whose import pushed nothing shows `nothing to promote`. Running `promote` on an older pipeline copies its digests again, which is how to roll prod back while that pipeline's `imported.json` artifact lasts (90 days).
 
-Upgrading: the import job's environment was `mirror-high`. Rescope those variables to `dev`.
+Upgrading: the import job's environment was `mirror-high`. Rescope those variables to `dev`; a variable scoped to `mirror-high` no longer reaches the job. The NiFi parameters are now `gitlab.api.url`, `gitlab.container.projectId`, `gitlab.container.branch` and `gitlab.container.token` (were `gitlab.api`, `gitlab.project`, `gitlab.ref`, `gitlab.token`): `nifi/flow.py` rebuilds the context with the new names; a flow built by hand needs the parameters and the `#{...}` references renamed.
+
+Each `import` and `sync` log starts with the settings it read, for example `setting: IMPORT_DELETE_BUNDLES is not set in this job (environment dev): imported bundles stay in the store`, and each bundle ends with `deleted from the store`, `nothing to delete in the store` or `kept in the store (IMPORT_DELETE_BUNDLES is not true)`.
 
 ## Both sides
 
