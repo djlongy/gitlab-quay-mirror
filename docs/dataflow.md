@@ -119,7 +119,11 @@ retries with backoff for about 17 minutes.
 
 Each accepted post logs `posted to NiFi: <file> -> <url> (HTTP 200, <bytes>, X-Sha256 ...)`.
 Once NiFi accepts the bundle, sync records its images as sent in the ledger.
-Without `NIFI_URL`, a set `MIRROR_BUNDLE_DIR` keeps the bundle for hand-carry. With neither,
+With `MIRROR_DROP` instead of `NIFI_URL`, sync does not post. It writes each file with the same
+attributes already packaged in FlowFile v3 format, as `<file>.ffv3`, into the directory (renamed
+from `.ffv3.partial` once complete) or as an object in the `S3_*` bucket, and logs
+`dropped for NiFi: ...`. The low NiFi lists and collects it (step 6).
+Without either, a set `MIRROR_BUNDLE_DIR` keeps the bundle for hand-carry. With neither,
 sync updates the low registry only, records nothing as sent, and the next run with a
 destination sends those images.
 
@@ -128,6 +132,10 @@ destination sends those images.
 NiFi's ListenHTTP receives each file. PackageFlowFile wraps the content and its attributes in
 FlowFile v3 format, and PutFile writes it into the link as `<file>.ffv3`. The attributes cross
 the link inside the package.
+
+With `MIRROR_DROP` the package already exists: ListFile and FetchFile (a directory) or ListS3
+and FetchS3Object (a bucket) collect `mirror-*.ffv3`, PutFile writes it into the link unchanged,
+and both flows then delete the source file or object.
 
 ## High side
 

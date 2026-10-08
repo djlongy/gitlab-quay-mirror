@@ -18,7 +18,9 @@ Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` 
 |---|---|---|---|
 | Required | `TARGET_REGISTRY` | none | Low registry, `host[:port]` |
 | Required | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account that can push; leave unset for a registry without auth |
-| Required | `NIFI_URL` | none | NiFi ListenHTTP the bundles are posted to |
+| Required, one of | `NIFI_URL` | none | NiFi ListenHTTP the bundles are posted to |
+| Required, one of | `MIRROR_DROP` | none | Instead of posting: a directory the low NiFi lists (an NFS share such as `/mnt/transfer`), or `s3` for a bucket it lists. See [Low side without ListenHTTP](#low-side-without-listenhttp) |
+| With `MIRROR_DROP=s3` | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; optional `S3_PREFIX`, `S3_REGION`, `S3_CA_BUNDLE`, `S3_TLS_VERIFY` | none | The low-side bucket |
 | Optional | `TARGET_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
 | Optional | `SOURCE_REGISTRY`, `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD`, `SOURCE_REGISTRY_TLS_VERIFY` | none | Login and TLS setting for one source registry, for example `docker.io` against rate limits; other source hosts pull anonymously with TLS verified |
 | Optional | `MIRROR_PLATFORM` | all platforms | One platform, for example `linux/amd64` |
@@ -46,6 +48,27 @@ python3 mirror.py add-list lists/ --prefix team   # lists/monitoring.txt: prom/p
 A latest-only image also gets the version it reports, so `latest` can move while `8.10.2` stays. An image whose source is `TARGET_REGISTRY` itself is only verified there and sent, with that registry's login and TLS settings; no `SOURCE_REGISTRY` setting is needed. Renovate proposes updates as merge requests for the registries it can reach; `scan` must pass before one merges.
 
 You know it works when the `sync` log shows `pushed to target registry: <host>/team/prometheus:v3.13.4@sha256:...` and `posted to NiFi: mirror-<stream>-<n>.tar -> <NIFI_URL> (HTTP 200, ...)`.
+
+### Low side without ListenHTTP
+
+When the runner cannot reach a NiFi listener, or NiFi should pull instead of being pushed to, set
+`MIRROR_DROP`. Sync then writes each bundle (or part) as `<file>.ffv3`: the file already packaged
+in NiFi's FlowFile v3 format with `filename` and the `X-` attributes NiFi would have taken from
+the headers. The low NiFi only collects it and moves it into the link, and the high side is
+unchanged.
+
+| `MIRROR_DROP` | Sync writes | Low NiFi flow |
+|---|---|---|
+| a directory, e.g. `/mnt/transfer` | `<file>.ffv3.partial`, renamed to `<file>.ffv3` once complete | `flow.py --side low --source dir --param mirror.drop=/mnt/transfer`: ListFile `mirror-*.ffv3`, FetchFile, PutFile into the link, then DeleteFile |
+| `s3` | `PUT <S3_PREFIX>/<file>.ffv3` | `flow.py --side low --source s3 --param s3.endpoint=... --param s3.bucket=... --param s3.prefix=...`: ListS3, FetchS3Object, PutFile into the link, then DeleteS3Object |
+
+- Directory: mount the same share on the runner (a shell runner, or a `volumes` entry in a Docker
+  runner's config) and in NiFi. NiFi's user must be able to read the files and delete them from
+  the directory.
+- S3: NiFi reads the keys from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` when you run
+  `flow.py`, and `s3.ca=@ca.pem` is needed only for a private CA. NiFi's ListS3, FetchS3Object
+  and DeleteS3Object use path-style requests when an endpoint is set.
+- Sync logs `dropped for NiFi: <file>.ffv3 -> <directory or bucket> (<bytes>, X-Sha256 ...)`.
 
 ## High side: receive, load, push
 

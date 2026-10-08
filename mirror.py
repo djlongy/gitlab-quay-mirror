@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import ssl
+import struct
 import subprocess
 import sys
 import tarfile
@@ -297,13 +298,14 @@ def s3_enabled():
     return os.environ.get("IMPORT_STORE", "gitlab") == "s3"
 
 
-def s3_request(method, key, data=None):
-    """One path-style request to an S3-compatible store, signed with AWS Signature Version 4."""
+def s3_request(method, key, data=None, length=None):
+    """One path-style request to an S3-compatible store, signed with AWS Signature Version 4.
+    A file-like data needs its length, or urllib would send it chunked, which S3 refuses."""
     endpoint = os.environ.get("S3_ENDPOINT", "").rstrip("/")
     bucket = os.environ.get("S3_BUCKET", "")
     access, secret = os.environ.get("AWS_ACCESS_KEY_ID", ""), os.environ.get("AWS_SECRET_ACCESS_KEY", "")
     if not (endpoint and bucket and access and secret):
-        raise MirrorError("IMPORT_STORE=s3 needs S3_ENDPOINT, S3_BUCKET, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+        raise MirrorError("S3 needs S3_ENDPOINT, S3_BUCKET, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
     region = os.environ.get("S3_REGION") or "us-east-1"
     prefix = os.environ.get("S3_PREFIX", "").strip("/")
     url = f"{endpoint}/{urllib.parse.quote(bucket)}/{urllib.parse.quote((prefix + '/' if prefix else '') + key)}"
@@ -321,6 +323,8 @@ def s3_request(method, key, data=None):
     headers["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={signed}, "
                                 f"Signature={hmac.new(signing, to_sign.encode(), hashlib.sha256).hexdigest()}")
     del headers["host"]  # urllib sends the same value
+    if length is not None:
+        headers["Content-Length"] = str(length)
     context = ssl.create_default_context()
     if os.environ.get("S3_TLS_VERIFY") == "false":
         context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
@@ -748,11 +752,16 @@ def app_version(reference, side):
 
 
 def post_file(path, kind, extra=()):
-    """POST one file to NIFI_URL with its sha256 in X-Sha256 and the routing headers."""
+    """POST one file to NIFI_URL with its sha256 in X-Sha256 and the routing headers, or drop it in MIRROR_DROP."""
+    file_sum, file_size = sha256(path), path.stat().st_size
+    if os.environ.get("MIRROR_DROP"):
+        drop(path, {"X-Sha256": file_sum, "X-Artifact-Type": "container-images", "X-Artifact-Format": "tar",
+                    "X-Artifact-Action": "mirror", "X-Bundle-Kind": kind,
+                    **dict(header.split(": ", 1) for header in extra)})
+        return
     url = os.environ["NIFI_URL"]
     parts = urllib.parse.urlsplit(url)
     shown = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()  # no credentials in the log
-    file_sum, file_size = sha256(path), path.stat().st_size
     # HTTP/1.1 keeps the header names as written; HTTP/2 would lowercase them and break a case-sensitive
     # RouteOnAttribute. --upload-file streams the file (--data-binary would read it all into memory),
     # an empty Expect skips the 100-continue round trip, and the time limit allows 1 MB/s. NiFi answers
@@ -768,13 +777,72 @@ def post_file(path, kind, extra=()):
           f"X-Sha256 {file_sum})")
 
 
+def flowfile_v3(attributes, size):
+    """The header NiFi's flowfile-stream-v3 packaging writes before the content, which UnpackContent reads:
+    magic, attribute count, each name and value, then the content length."""
+    def field(number):  # under 65535 in two bytes, otherwise 0xFFFF and four more
+        return struct.pack(">H", number) if number < 0xFFFF else b"\xff\xff" + struct.pack(">I", number)
+
+    def text(value):
+        data = value.encode()
+        return field(len(data)) + data
+    return (b"NiFiFF3" + field(len(attributes)) + b"".join(text(k) + text(v) for k, v in attributes.items())
+            + struct.pack(">Q", size))
+
+
+class Joined(io.RawIOBase):
+    """Several readable streams read as one."""
+
+    def __init__(self, *streams):
+        self.streams = list(streams)
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        while self.streams:
+            count = self.streams[0].readinto(buffer)
+            if count:
+                return count
+            self.streams.pop(0)
+        return 0
+
+
+def drop(path, attributes):
+    """Leave one file for the low NiFi to collect as <file>.ffv3, already packaged as its PackageFlowFile
+    would, so that NiFi only lists, fetches and moves it into the link. MIRROR_DROP is a directory (an NFS
+    share NiFi reads with ListFile) or s3 (the S3_* bucket, read with ListS3)."""
+    target, name, size = os.environ["MIRROR_DROP"], path.name + ".ffv3", path.stat().st_size
+    header = flowfile_v3({"filename": path.name, **attributes}, size)
+    with path.open("rb") as content:
+        if target == "s3":
+            try:
+                s3_request("PUT", name, Joined(io.BytesIO(header), content), len(header) + size).close()
+            except urllib.error.URLError as error:
+                raise MirrorError(f"S3 PUT {name}: {getattr(error, 'code', error.reason)}") from error
+            shown = f"s3 {os.environ.get('S3_BUCKET')}/{os.environ.get('S3_PREFIX', '').strip('/')}"
+        else:
+            directory = Path(target)
+            directory.mkdir(parents=True, exist_ok=True)
+            # Written under another name and renamed: NiFi lists only *.ffv3, so it never takes half a file.
+            partial = directory / (name + ".partial")
+            with partial.open("wb") as out:
+                out.write(header)
+                shutil.copyfileobj(content, out, 8 * 1024 * 1024)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(partial, directory / name)
+            shown = str(directory)
+    print(f"dropped for NiFi: {name} -> {shown} ({size} bytes, X-Sha256 {attributes['X-Sha256']})")
+
+
 def notify(bundle, kind):
     """POST a written bundle to NIFI_URL. One file, one webhook on the high side: NiFi there verifies
     X-Sha256 and writes the .sha256 beside the bundle in the store. A bundle over
     MIRROR_BUNDLE_MAX_SIZE goes as <bundle>.part-001.. of at most that size (send() streams such a
     bundle straight into parts when it does not also keep it for hand-carry); X-Bundle-Name,
     X-Bundle-Sha256 and X-Bundle-Parts let the high side record the whole and import rejoin it."""
-    if not os.environ.get("NIFI_URL"):
+    if not delivers():
         return
     checksum, size, cap = sha256(bundle), bundle.stat().st_size, bundle_cap()
     count = -(-size // cap)
@@ -800,6 +868,7 @@ def notify(bundle, kind):
 def sync(path, full=False):
     low = registry("TARGET_REGISTRY")
     settings(("NIFI_URL", "bundles are not posted to NiFi", False),
+             ("MIRROR_DROP", "bundles are not left in a directory or bucket for NiFi", False),
              ("MIRROR_BUNDLE_DIR", "bundles are not kept for hand-carry", False),
              ("MIRROR_LEDGER", "what was sent is kept only in MIRROR_STATE_DIR, which a CI job does not keep", False),
              ("MIRROR_PLATFORM", "every platform of each image is sent", False),
@@ -881,7 +950,7 @@ def sync(path, full=False):
             # The ledger says what crossed to the high side, so it records only a bundle that left.
             save_state(state_file, state, remote=json.dumps(state, sort_keys=True) != loaded)
             print(f"target registry updated; {len(changed)} image(s) not sent to the high side: "
-                  "set NIFI_URL, or MIRROR_BUNDLE_DIR to hand-carry bundles")
+                  "set NIFI_URL or MIRROR_DROP, or MIRROR_BUNDLE_DIR to hand-carry bundles")
             return None
         if not changed:
             # A quiet day rewrites the ledger head only when the cached tag choices changed.
@@ -953,9 +1022,16 @@ def send_batches(work, state_file, state, low, changed, full, kind, bridges=None
     return bundle
 
 
+def delivers():
+    """Set when each bundle goes to NiFi (NIFI_URL, or MIRROR_DROP for NiFi to collect) and leaves the runner."""
+    if os.environ.get("NIFI_URL") and os.environ.get("MIRROR_DROP"):
+        raise MirrorError("set NIFI_URL or MIRROR_DROP, not both")
+    return os.environ.get("NIFI_URL") or os.environ.get("MIRROR_DROP")
+
+
 def bundle_destination():
     """Where a bundle goes: NiFi, or a directory someone carries across. None means nowhere."""
-    return os.environ.get("NIFI_URL") or os.environ.get("MIRROR_BUNDLE_DIR")
+    return delivers() or os.environ.get("MIRROR_BUNDLE_DIR")
 
 
 def send(work, state_file, state, low, changed, full, kind, bridges=None):
@@ -1003,7 +1079,7 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
         write_json(stage / "images.json", metadata)
         bundle = outbox / f"mirror-{state['stream']}-{state['sequence']:012d}.tar"
         streamed = None
-        if os.environ.get("NIFI_URL") and not os.environ.get("MIRROR_BUNDLE_DIR"):
+        if delivers() and not os.environ.get("MIRROR_BUNDLE_DIR"):
             # Measure first: a bundle over the cap goes to NiFi as parts straight from the tar writer,
             # so the runner never holds the whole tar beside the staged images.
             measure = TarSink()
@@ -1028,7 +1104,7 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
             record_ledger(state, metadata, kind, bundle.name)
         size = bundle.stat().st_size
         notify(bundle, kind)
-        if os.environ.get("NIFI_URL"):
+        if delivers():
             # Delivered: the images stay in the target registry and the record in the ledger, so nothing stays on the runner.
             for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
                 path.unlink()
@@ -1045,7 +1121,7 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
     state["pending"] = False
     save_state(state_file, state)
     print(f"bundle: {bundle.name} ({len(changed)} image(s), {size} bytes)"
-          + (", delivered and removed" if os.environ.get("NIFI_URL") else f", left in {bundle.parent}"))
+          + (", delivered and removed" if delivers() else f", left in {bundle.parent}"))
     return bundle
 
 
@@ -1148,7 +1224,7 @@ def resend(since=None, sequences=None, image=None):
     if not (since or sequences or image):
         raise MirrorError("resend needs --since, --sequence or --image")
     if not bundle_destination():
-        raise MirrorError("resend writes a bundle; set NIFI_URL, or MIRROR_BUNDLE_DIR to hand-carry it")
+        raise MirrorError("resend writes a bundle; set NIFI_URL or MIRROR_DROP, or MIRROR_BUNDLE_DIR to hand-carry it")
     low = registry("TARGET_REGISTRY")
     work = state_path("MIRROR_STATE_DIR", "registry-mirror")
     with locked(work):
@@ -1627,6 +1703,7 @@ Low side (pull from the source, save to your registry, send bundles):
   mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus
   mirror.py add-list lists/ --prefix team   # every image in lists/*.txt
   mirror.py sync                      # NIFI_URL set: bundle posted to NiFi
+  MIRROR_DROP=/mnt/transfer mirror.py sync   # or MIRROR_DROP=s3: left for the low NiFi to collect
   mirror.py resend --sequence 7..     # the high side reported bundle 7 missing
 
 High side (receive bundles, push to your registry, promote dev to prod):
@@ -1663,7 +1740,7 @@ def main(argv=None):
     add.add_argument("source", help="registry/repository:tag in full, e.g. docker.io/library/alpine:3.20")
     add.add_argument("target", help="repository path in TARGET_REGISTRY, any depth, e.g. team/prometheus")
     sync_command = command("sync", "mirror the catalog into TARGET_REGISTRY and send what changed",
-                           "  mirror.py sync          # send changed images; NIFI_URL or MIRROR_BUNDLE_DIR receives\n"
+                           "  mirror.py sync          # send changed images; NIFI_URL, MIRROR_DROP or MIRROR_BUNDLE_DIR receives\n"
                            "  mirror.py sync --all    # send every approved image (recovery, RESEND_ALL=true in CI)")
     sync_command.add_argument("--all", action="store_true", help="send every approved image, not only changes")
     resend_command = command("resend", "resend recorded images as the next bundle (MIRROR_LEDGER=true)",

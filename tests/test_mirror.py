@@ -1112,6 +1112,79 @@ class LedgerTest(unittest.TestCase):
         self.assertIn(mock.call(f'missing: nginx:1.29 ({compose}:3)'), said.call_args_list)
 
 
+def unpack_flowfile(data):
+    """NiFi's FlowFileUnpackagerV3, for one packaged file."""
+    assert data[:7] == b'NiFiFF3'
+    position = 7
+
+    def field():
+        nonlocal position
+        number = int.from_bytes(data[position:position + 2], 'big')
+        position += 2
+        if number == 0xFFFF:
+            number = int.from_bytes(data[position:position + 4], 'big')
+            position += 4
+        return number
+
+    def text():
+        nonlocal position
+        length = field()
+        position += length
+        return data[position - length:position].decode()
+    attributes = {text(): text() for _ in range(field())}
+    size = int.from_bytes(data[position:position + 8], 'big')
+    content = data[position + 8:]
+    assert len(content) == size
+    return attributes, content
+
+
+class DropTest(unittest.TestCase):
+    """MIRROR_DROP: bundles left as FlowFile packages in a directory or bucket for the low NiFi."""
+
+    setUp = MirrorTest.setUp
+
+    def test_parts_land_in_the_drop_directory_as_flowfiles_with_their_attributes(self):
+        bundle = self.root / 'mirror-x.tar'
+        bundle.write_bytes(b'0123456789')
+        drop = self.root / 'transfer'
+        os.environ.update({'MIRROR_DROP': str(drop), 'MIRROR_BUNDLE_MAX_SIZE': '4'})
+        with mock.patch('builtins.print'):
+            mirror.notify(bundle, 'delta')
+        self.assertEqual(sorted(p.name for p in drop.iterdir()),
+                         [f'mirror-x.tar.part-00{n}.ffv3' for n in (1, 2, 3)])  # no .partial left
+        attributes, content = unpack_flowfile((drop / 'mirror-x.tar.part-002.ffv3').read_bytes())
+        self.assertEqual(content, b'4567')
+        self.assertEqual(attributes, {
+            'filename': 'mirror-x.tar.part-002', 'X-Sha256': hashlib.sha256(b'4567').hexdigest(),
+            'X-Artifact-Type': 'container-images', 'X-Artifact-Format': 'tar', 'X-Artifact-Action': 'mirror',
+            'X-Bundle-Kind': 'delta', 'X-Bundle-Name': 'mirror-x.tar', 'X-Bundle-Sha256': mirror.sha256(bundle),
+            'X-Bundle-Parts': '3'})
+
+    def test_a_long_value_uses_the_wide_length_field(self):
+        attributes, content = unpack_flowfile(mirror.flowfile_v3({'a': 'v' * 70000}, 2) + b'ok')
+        self.assertEqual((len(attributes['a']), content), (70000, b'ok'))
+
+    def test_the_s3_drop_streams_the_package_with_its_length(self):
+        bundle = self.root / 'mirror-y.tar'
+        bundle.write_bytes(b'bundle')
+        os.environ.update({'MIRROR_DROP': 's3', 'S3_BUCKET': 'transfer'})
+        sent = {}
+
+        def put(method, key, data, length):
+            sent.update(method=method, key=key, body=data.read(), length=length)
+            return io.BytesIO()
+        with mock.patch.object(mirror, 's3_request', side_effect=put), mock.patch('builtins.print'):
+            mirror.notify(bundle, 'full')
+        self.assertEqual((sent['method'], sent['key'], sent['length']), ('PUT', 'mirror-y.tar.ffv3', len(sent['body'])))
+        attributes, content = unpack_flowfile(sent['body'])
+        self.assertEqual((attributes['filename'], attributes['X-Bundle-Kind'], content), ('mirror-y.tar', 'full', b'bundle'))
+
+    def test_nifi_url_and_mirror_drop_together_are_refused(self):
+        os.environ.update({'NIFI_URL': 'http://nifi.example.internal:9098/contentListener', 'MIRROR_DROP': 's3'})
+        with self.assertRaisesRegex(mirror.MirrorError, 'not both'):
+            mirror.bundle_destination()
+
+
 class LargeAndBulkTest(unittest.TestCase):
     """Size-capped bundles, bulk lists, path rewrites and out-of-order arrival."""
 
