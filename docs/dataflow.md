@@ -83,32 +83,42 @@ Every reference in the log is a pullable path. A run with nothing to send prints
 
 ### 4. Bundle
 
-The changed images go into one bundle: a tar of `images.json` and one folder per image in
+The changed images go into bundles of at most `MIRROR_BUNDLE_MAX_SIZE` (4 GiB by default),
+in catalog order; a large batch becomes several consecutive bundles, each sent and deleted
+before the next is built, so the runner holds one bundle at a time. Each bundle is a tar of `images.json` and one folder per image in
 skopeo's `dir:` layout, which keeps every manifest, config and layer byte for byte. `dir:`
 is used because the `oci:` layout must convert a Docker manifest list into an OCI index, and
 that changes the digest. Before writing, sync reserves the next sequence number in the
-ledger, so a crash cannot reuse it. Each file is checked against its digest. A `.sha256` file
-beside the tar holds the tar's checksum.
+ledger, so a crash cannot reuse it. Each file is checked against its digest. For hand-carry, a
+`.sha256` file beside the tar holds the tar's checksum.
 
 The bundle is named `mirror-<stream>-<sequence>.tar`. The stream is a random id fixed when the
 ledger is first created; the sequence counts up from 1.
 
 ### 5. Send
 
-`notify` posts the checksum file, then the tar, to `NIFI_URL` over HTTP/1.1 with these
-headers, which NiFi keeps as attributes:
+Sync posts the tar to `NIFI_URL` over HTTP/1.1, streamed from disk, with these headers, which
+NiFi keeps as attributes:
 
 | Header | Value |
 |---|---|
 | `Filename` | the file name |
 | `X-Sha256` | the file's SHA-256 |
 | `X-Artifact-Type` | `container-images` |
-| `X-Artifact-Format` | `tar` or `sha256` |
+| `X-Artifact-Format` | `tar` |
 | `X-Artifact-Action` | `mirror` |
 | `X-Bundle-Kind` | `delta`, `full` or `resend` |
+| `X-Bundle-Name`, `X-Bundle-Sha256`, `X-Bundle-Parts` | a part only: the whole bundle's name, SHA-256 and number of parts |
+
+A bundle over `MIRROR_BUNDLE_MAX_SIZE` (one image larger than the cap) goes as
+`<bundle>.part-001`, `.part-002` and so on, each at most the cap. Sync measures the tar in a
+first pass, then writes it straight into parts, posting and deleting each as it fills: the
+runner holds the staged images and one part, never the whole tar. So no NiFi, link, store or
+HTTP limit sees a file larger than the cap. NiFi answers 503 while its queue is full; sync
+retries with backoff for about 17 minutes.
 
 Each accepted post logs `posted to NiFi: <file> -> <url> (HTTP 200, <bytes>, X-Sha256 ...)`.
-Once NiFi accepts both files, sync deletes them and records the images as sent in the ledger.
+Once NiFi accepts the bundle, sync records its images as sent in the ledger.
 Without `NIFI_URL`, a set `MIRROR_BUNDLE_DIR` keeps the bundle for hand-carry. With neither,
 sync updates the low registry only, records nothing as sent, and the next run with a
 destination sends those images.
@@ -130,9 +140,11 @@ file whose hash differs from `X-Sha256`. NiFi then:
 
 1. Files it in `IMPORT_STORE` under `registry-mirror-bundles/<bundle>/<file>`: a PUT to the
    high project's generic package registry, or PutS3Object into the bucket.
-2. Starts the high project's pipeline through the API with `BUNDLE` set to the file name.
+2. Writes `<bundle>.tar.sha256` beside it from the checksum it has just verified, with the
+   number of parts after it for a bundle sent in parts.
+3. Starts the high project's pipeline through the API with `BUNDLE` set to the bundle's name.
 
-Each of a bundle's two files starts one pipeline.
+Each file starts one pipeline: one per bundle, or one per part.
 
 ### 8. Import
 
@@ -140,12 +152,18 @@ Each of a bundle's two files starts one pipeline.
 receipt holds the stream, the last sequence imported and that bundle's checksum. Import then:
 
 1. Fetches every later bundle the receipt points to, in order, and the announced one. A bundle
-   missing either file waits for the trigger that brings it.
+   whose checksum file or any part has not arrived waits for the trigger that brings it.
 2. Checks the tar against its `.sha256` and every manifest, config and layer inside against
-   its digest. Nothing is pushed before every check passes.
+   its digest. A bundle in parts is read part by part straight into the unpacked folder, each
+   part fetched when needed and deleted once read, and its checksum is compared at the end.
+   Nothing is pushed before every check passes.
 3. Accepts the next sequence, a full bundle, or a resend that covers a gap. It refuses an
-   older sequence, so a replayed bundle cannot roll a moved tag such as `latest` back. A
-   later sequence with a gap fails and names the low-side action:
+   older sequence, so a replayed bundle cannot roll a moved tag such as `latest` back. A later
+   sequence that arrives before an earlier one waits in the store: the job exits 3, which the
+   pipeline shows as a warning, `waiting: <bundle> is stored and imports when the earlier
+   bundle arrives`, and the earlier one's trigger imports both in order. Once the waiting bundle
+   has been in the store longer than `IMPORT_GAP_GRACE` (6 hours by default), the earlier one is
+   taken as lost and the job fails with the low-side action:
    `missing earlier bundle 7 to 8 (imported up to 6, received 9); on the low side, Run pipeline with RESEND_SEQUENCE=7..`.
 4. Pushes each image with `skopeo copy --preserve-digests`, reads the manifest back, checks the
    digest and logs `pushed to target registry: <host>/<path>:<tag>@sha256:...`.

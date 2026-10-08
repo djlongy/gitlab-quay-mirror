@@ -4,15 +4,16 @@
 usage: flow.py --side low|high [--url https://nifi:8443] [--user admin] [--password ...]
                [--param name=value ...] [--insecure] [--export FILE]
 
-low:  ListenHTTP :#{mirror.port}/contentListener   (sync and resend POST each file here, NIFI_URL)
+low:  ListenHTTP :#{mirror.port}/contentListener   (sync and resend POST each bundle here, NIFI_URL)
         -> PackageFlowFile                       (keeps Filename and the X- headers with the content)
         -> PutFile #{mirror.diode}                 (the diode's ingress directory, as <file>.ffv3)
 high: ListFile #{mirror.diode} -> FetchFile        (the diode's egress directory; deletes what it takes)
         -> UnpackContent flowfile-stream-v3      (the original file and its attributes again)
-        -> RouteOnAttribute container-images     (X-Artifact-Type and X-Artifact-Action)
+        -> RouteOnAttribute container-images     (X-Artifact-Type, X-Artifact-Action, a .tar or .tar.part-NNN)
         -> CryptographicHashContent -> RouteOnAttribute verified   (content matches X-Sha256)
-        -> InvokeHTTP PUT  generic package registry-mirror-bundles/<bundle>/<file>   (PRIVATE-TOKEN)
-        -> InvokeHTTP POST pipeline?ref=#{gitlab.container.branch} with BUNDLE=<file> (mirror.py import --registry)
+        -> InvokeHTTP PUT  generic package registry-mirror-bundles/<bundle>/<bundle>.tar   (PRIVATE-TOKEN)
+        -> ReplaceText "<sha256>  <bundle>.tar[  <parts>]" -> InvokeHTTP PUT <bundle>.tar.sha256  (written here)
+        -> InvokeHTTP POST pipeline?ref=#{gitlab.container.branch} with BUNDLE=<bundle>.tar (one per bundle)
 
 Anything not matching ends in "Rejected (inspect queue)", left stopped so it waits there.
 gitlab.container.token is a sensitive parameter: a project access token, role Developer, scope api.
@@ -166,41 +167,62 @@ def build_high(n, pg, store="gitlab"):
                         terminate=("not.found",))
     unpack = n.processor(pg, "UnpackContent", "Restore file and attributes", 2,
                          {"Packaging Format": "flowfile-stream-v3"}, terminate=("original",))
+    # One file per bundle crosses the link. A .sha256 from a low side that still sends one is dropped:
+    # this flow writes its own from the verified X-Sha256.
     route = n.processor(pg, "RouteOnAttribute", "Container bundles only", 3, {
         "Routing Strategy": "Route to Property name",
         "container-images": "${X-Artifact-Type:equals('container-images'):and(${X-Artifact-Action:equals('mirror')})"
-                            ":and(${filename:matches('mirror-[0-9a-f]{32}-[0-9]{12}[.]tar([.]sha256)?')})}"})
+                            ":and(${filename:matches('mirror-[0-9a-f]{32}-[0-9]{12}[.]tar([.]part-[0-9]{3})?')})}",
+        "old-checksum": "${filename:matches('mirror-[0-9a-f]{32}-[0-9]{12}[.]tar[.]sha256')}"},
+        terminate=("old-checksum",))
     hashing = n.processor(pg, "CryptographicHashContent", "Hash file", 4, {"Hash Algorithm": "SHA-256"})
     verified = n.processor(pg, "RouteOnAttribute", "File matches X-Sha256", 5, {
         "Routing Strategy": "Route to Property name", "verified": "${content_SHA-256:equals(${X-Sha256})}"})
+    def uploader(name, y):
+        if store == "s3":
+            # The same <package>/<version>/<file> layout as the generic package, so import reads either store.
+            return n.processor(pg, "PutS3Object", name, y, {
+                "Bucket": "#{s3.bucket}", "Region": "#{s3.region}", "Endpoint Override URL": "#{s3.endpoint}",
+                # s3.prefix matches the pipeline's S3_PREFIX, kept with a trailing slash.
+                "Object Key": "#{s3.prefix}registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
+                "use-path-style-access": "true", "AWS Credentials Provider service": credentials,
+                "SSL Context Service": trust})
+        return n.processor(pg, "InvokeHTTP", name, y, {
+            "HTTP Method": "PUT", "Request Body Enabled": "true",
+            "HTTP URL": gitlab + "/packages/generic/registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
+            "PRIVATE-TOKEN": "#{gitlab.container.token}", "Response Body Attribute Name": "gitlab.response"},
+            terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
+
+    credentials = trust = None
     if store == "s3":
         credentials = n.service(pg, "AWSCredentialsProviderControllerService", "S3 credentials",
                                 {"Access Key": "#{s3.access_key}", "Secret Key": "#{s3.secret_key}"})
         trust = n.service(pg, "PEMEncodedSSLContextProvider", "S3 CA", {
             "Private Key Source": "UNDEFINED", "Certificate Authorities Source": "PROPERTIES",
             "Certificate Authorities": "#{s3.ca}"})
-        # The same <package>/<version>/<file> layout as the generic package, so import reads either store.
-        upload = n.processor(pg, "PutS3Object", "Upload to S3", 6, {
-            "Bucket": "#{s3.bucket}", "Region": "#{s3.region}", "Endpoint Override URL": "#{s3.endpoint}",
-            # s3.prefix matches the pipeline's S3_PREFIX, kept with a trailing slash.
-            "Object Key": "#{s3.prefix}registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
-            "use-path-style-access": "true", "AWS Credentials Provider service": credentials,
-            "SSL Context Service": trust})
-    else:
-        upload = n.processor(pg, "InvokeHTTP", "Upload to GitLab", 6, {
-            "HTTP Method": "PUT", "Request Body Enabled": "true",
-            "HTTP URL": gitlab + "/packages/generic/registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
-            "PRIVATE-TOKEN": "#{gitlab.container.token}", "Response Body Attribute Name": "gitlab.response"},
-            terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
-    start = n.processor(pg, "InvokeHTTP", "Start the import pipeline", 7, {
+    upload = uploader("Upload the bundle", 6)
+    # The checksum the low side sent, as the .sha256 import reads beside the bundle. A bundle sent in
+    # parts carries the whole bundle's name, checksum and part count in X-Bundle-*; each part writes the
+    # same file, and import joins the parts once all have arrived.
+    whole = "${X-Bundle-Name:replaceNull(${filename})}"
+    checksum = n.processor(pg, "UpdateAttribute", "Name the checksum", 7,
+                           {"bundle.name": whole, "filename": whole + ".sha256"})
+    content = n.processor(pg, "ReplaceText", "Write the checksum", 8, {
+        "Replacement Strategy": "Always Replace", "Evaluation Mode": "Entire text",
+        "Replacement Value": "${X-Bundle-Sha256:replaceNull(${X-Sha256})}  ${bundle.name}"
+                             "${X-Bundle-Parts:isNull():ifElse('', ${X-Bundle-Parts:prepend('  ')})}\n"},
+        terminate=("failure",))
+    sidecar = uploader("Upload the checksum", 9)
+    # One pipeline per bundle, started once both files are in the store.
+    start = n.processor(pg, "InvokeHTTP", "Start the import pipeline", 10, {
         "HTTP Method": "POST", "Request Body Enabled": "false",
         # variables[][key]=BUNDLE&variables[][value]=<file>, brackets encoded
         "HTTP URL": gitlab + "/pipeline?ref=#{gitlab.container.branch}&variables%5B%5D%5Bkey%5D=BUNDLE"
-                             "&variables%5B%5D%5Bvalue%5D=${filename:urlEncode()}",
+                             "&variables%5B%5D%5Bvalue%5D=${bundle.name:urlEncode()}",
         "PRIVATE-TOKEN": "#{gitlab.container.token}", "Response Body Attribute Name": "gitlab.response"},
         terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
-    done = n.processor(pg, "UpdateAttribute", "Delivered", 8, {})
-    rejected = n.processor(pg, "UpdateAttribute", "Rejected (inspect queue)", 9, {})
+    done = n.processor(pg, "UpdateAttribute", "Delivered", 11, {})
+    rejected = n.processor(pg, "UpdateAttribute", "Rejected (inspect queue)", 12, {})
     n.connect(pg, listing, fetch, ["success"])
     n.connect(pg, fetch, unpack, ["success"])
     n.connect(pg, fetch, fetch, ["failure", "permission.denied"])
@@ -212,17 +234,20 @@ def build_high(n, pg, store="gitlab"):
     n.connect(pg, hashing, rejected, ["failure"])
     n.connect(pg, verified, upload, ["verified"])
     n.connect(pg, verified, rejected, ["unmatched"])
-    if store == "s3":
-        n.connect(pg, upload, start, ["success"])
-        n.connect(pg, upload, rejected, ["failure"])
-    else:
-        n.connect(pg, upload, start, ["Original"])
-        n.connect(pg, upload, upload, ["Retry"])
-        n.connect(pg, upload, rejected, ["No Retry", "Failure"])
+    for put, following in ((upload, checksum), (sidecar, start)):
+        if store == "s3":
+            n.connect(pg, put, following, ["success"])
+            n.connect(pg, put, rejected, ["failure"])
+        else:
+            n.connect(pg, put, following, ["Original"])
+            n.connect(pg, put, put, ["Retry"])
+            n.connect(pg, put, rejected, ["No Retry", "Failure"])
+    n.connect(pg, checksum, content, ["success"])
+    n.connect(pg, content, sidecar, ["success"])
     n.connect(pg, start, done, ["Original"])
     n.connect(pg, start, start, ["Retry"])
     n.connect(pg, start, rejected, ["No Retry", "Failure"])
-    return [listing, fetch, unpack, route, hashing, verified, upload, start]
+    return [listing, fetch, unpack, route, hashing, verified, upload, checksum, content, sidecar, start]
 
 
 def main():

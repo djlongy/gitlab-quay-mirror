@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import urllib.request
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -35,7 +37,7 @@ MANIFESTS = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.dock
 CHART_CONFIG = "application/vnd.cncf.helm.config.v1+json"
 CHART_LAYERS = ("application/vnd.cncf.helm.chart.content.v1.tar+gzip", "application/vnd.cncf.helm.chart.provenance.v1.prov")
 LEDGER, BUNDLES, RECEIPTS = "registry-mirror-ledger", "registry-mirror-bundles", "registry-mirror-receipt"
-BUNDLE_NAME = re.compile(r"(mirror-[0-9a-f]{32}-[0-9]{12})\.tar(?:\.sha256)?")
+BUNDLE_NAME = re.compile(r"(mirror-[0-9a-f]{32}-[0-9]{12})\.tar(?:\.sha256|\.part-[0-9]{3})?")
 INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
 
 
@@ -45,6 +47,10 @@ class MirrorError(Exception):
 
 class SequenceGap(MirrorError):
     pass
+
+
+class GapWaiting(MirrorError):
+    """A later bundle is stored and waits for an earlier one still on its way: exit 3, a CI warning."""
 
 
 def required_env(name):
@@ -356,6 +362,52 @@ def store_put(package, version, name, data):
         raise MirrorError(f"S3 PUT {package}/{version}/{name}: {getattr(error, 'code', error.reason)}") from error
 
 
+def store_exists(package, version, name):
+    """Whether the store holds a file, without downloading it."""
+    try:
+        if s3_enabled():
+            s3_request("HEAD", f"{package}/{version}/{name}").close()
+        else:
+            package_request("HEAD", package, version, name).close()
+        return True
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return False
+        raise MirrorError(f"HEAD {package}/{version}/{name}: HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise MirrorError(f"HEAD {package}/{version}/{name}: {error.reason}") from error
+
+
+def store_age(package, version, name):
+    """Hours since a bundle reached the store, from GitLab's package created_at or S3's Last-Modified."""
+    try:
+        if s3_enabled():
+            with s3_request("HEAD", f"{package}/{version}/{name}") as response:
+                stored = parsedate_to_datetime(response.headers["Last-Modified"])
+        else:
+            base, (key, value) = packages()
+            query = urllib.parse.urlencode({"package_type": "generic", "package_name": package,
+                                            "package_version": version})
+            found = [p for p in json.loads(package_api("GET", f"{base.rsplit('/generic', 1)[0]}?{query}", key, value))
+                     if p["name"] == package and p["version"] == version]
+            if not found:
+                return None
+            stored = datetime.fromisoformat(found[0]["created_at"].replace("Z", "+00:00"))
+    except (urllib.error.URLError, KeyError, ValueError) as error:
+        say(f"cannot tell how long {version} has waited: {error}")
+        return None
+    return (datetime.now(timezone.utc) - stored).total_seconds() / 3600
+
+
+def gap_grace():
+    """IMPORT_GAP_GRACE: hours a later bundle may wait for an earlier one before import fails."""
+    text = os.environ.get("IMPORT_GAP_GRACE", "").strip() or "6"
+    try:
+        return float(text)
+    except ValueError:
+        raise MirrorError(f"IMPORT_GAP_GRACE must be a number of hours, not {text!r}") from None
+
+
 def store_delete(package, version, names):
     """Remove an imported bundle: its objects in the bucket, or its generic package version.
     Returns how many generic packages were deleted; S3 does not report a missing object."""
@@ -460,7 +512,27 @@ def image_child(child, fetch, depth):
     return kind in MANIFESTS or (kind is None and bool(child.get("platform")))
 
 
-def add_image(path, source, target):
+def rewrite(path, setting):
+    """A repository path under the first matching old=new prefix rule in setting (comma-separated;
+    the longest old prefix wins, matched on whole path segments)."""
+    rules = []
+    for rule in filter(None, (part.strip() for part in os.environ.get(setting, "").split(","))):
+        old, separator, new = rule.partition("=")
+        old, new = old.strip().strip("/"), new.strip().strip("/")
+        if not separator or not old or not new:
+            raise MirrorError(f"{setting}: expected old=new prefix pairs, not {rule!r}")
+        rules.append((old, new))
+    for old, new in sorted(rules, key=lambda rule: -len(rule[0])):
+        if path == old or path.startswith(old + "/"):
+            moved = new + path[len(old):]
+            if not TARGET.fullmatch(moved):
+                raise MirrorError(f"{setting}: {path} becomes {moved}, not a valid repository path")
+            return moved
+    return path
+
+
+def resolve_entry(source, target):
+    """Pin source to the digest its tag points at now; returns the catalog image and the tags it publishes."""
     name = source.split("@", 1)[0]
     if not re.match(rf"(?:{HOST})/", name):
         raise MirrorError(f"{source} has no registry host; give the full reference, for example {normalise(source)}")
@@ -477,14 +549,85 @@ def add_image(path, source, target):
     repository = "docker://" + name.rsplit(":", 1)[0]
     tags = publish_tags(image["tag"], platform_digest(f"{repository}@{digest}", digest, side_of(source)),
                         repository, side_of(source))
+    return image, tags
+
+
+def write_catalog(path, lines):
+    """Add catalog lines and keep the file sorted a to z by source. Leading comments stay at the
+    top; a comment directly above an entry moves with it."""
+    header, groups, notes = [], [], []
+    for raw in (path.read_text().splitlines() if path.exists() else []):
+        text = raw.strip()
+        if not groups and (not text or text.startswith("#")):
+            header.append(raw)
+        elif text.startswith("#"):
+            notes.append(raw)
+        elif text:
+            groups.append((text, notes + [raw]))
+            notes = []
+    groups += [(line, [line]) for line in lines]
+    groups.sort(key=lambda group: group[0])
+    groups += [("", notes)] if notes else []  # comments after the last entry stay last
+    body = "\n".join(header + [line for _, block in groups for line in block])
+    path.write_text(body + "\n" if body else "")
+
+
+def add_image(path, source, target):
+    image, tags = resolve_entry(source, target)
     images = catalog(path) if path.exists() else []
     if any((i['target'], i['tag']) == (target, image['tag']) for i in images):
         raise MirrorError("target tag already exists; edit its reviewed catalog entry")
-    with path.open("a") as stream:
-        if path.stat().st_size and not path.read_text().endswith("\n"):
-            stream.write("\n")
-        stream.write(f"{image['source']} {target}\n")
+    write_catalog(path, [f"{image['source']} {target}"])
     print(f"added: {image['source']} -> {target}:{', :'.join(tags)}")
+
+
+def list_reference(text):
+    """An image named in a list file, as docker pull reads it: no registry host means docker.io
+    (and library/ for a one-part name), no tag means :latest. The catalog gets the full form."""
+    full = normalise(text)
+    name, separator, digest = full.partition("@")
+    if ":" not in name.rsplit("/", 1)[-1]:
+        name += ":latest"
+    full = name + separator + digest
+    if full != text:
+        print(f"expanded: {text} -> {full}")
+    return full
+
+
+def add_list(path, folder, prefix=None):
+    """Add every image named in folder/*.txt, one per line. Each target is the source path without
+    its registry host, under prefix. What resolves is written even when other lines fail."""
+    files = sorted(Path(folder).glob("*.txt"))
+    if not files:
+        raise MirrorError(f"{folder}: no *.txt files")
+    existing = {(i["target"], i["tag"]) for i in (catalog(path) if path.exists() else [])}
+    added, failed = [], []
+    for file in files:
+        for number, raw in enumerate(file.read_text().splitlines(), 1):
+            text = raw.split("#", 1)[0].strip()
+            if not text:
+                continue
+            where = f"{file.name}:{number}"
+            try:
+                source = list_reference(text)
+                name = source.split("@", 1)[0]
+                repository, tag = name.rsplit(":", 1)
+                target = repository.split("/", 1)[1]
+                target = f"{prefix.strip('/')}/{target}" if prefix else target
+                if (target, tag) in existing:
+                    print(f"already in the catalog: {where} {source} -> {target}:{tag}")
+                    continue
+                image, tags = resolve_entry(source, target)
+                existing.add((target, tag))
+                added.append(f"{image['source']} {target}")
+                print(f"added: {where} {image['source']} -> {target}:{', :'.join(tags)}")
+            except MirrorError as error:
+                failed.append(f"{where} {text}: {error}")
+    if added:
+        write_catalog(path, added)
+    print(f"{len(added)} added to {path.name}, {len(failed)} failed")
+    if failed:
+        raise MirrorError(f"{len(failed)} line(s) not added:\n  " + "\n  ".join(failed))
 
 
 def verify_image(directory, digest):
@@ -604,25 +747,54 @@ def app_version(reference, side):
     return next((v for v in found if v and re.fullmatch(TAG, v)), "")
 
 
+def post_file(path, kind, extra=()):
+    """POST one file to NIFI_URL with its sha256 in X-Sha256 and the routing headers."""
+    url = os.environ["NIFI_URL"]
+    parts = urllib.parse.urlsplit(url)
+    shown = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()  # no credentials in the log
+    file_sum, file_size = sha256(path), path.stat().st_size
+    # HTTP/1.1 keeps the header names as written; HTTP/2 would lowercase them and break a case-sensitive
+    # RouteOnAttribute. --upload-file streams the file (--data-binary would read it all into memory),
+    # an empty Expect skips the 100-continue round trip, and the time limit allows 1 MB/s. NiFi answers
+    # 503 while its queue is full (back pressure); ten retries back off from 1 s to about 8 minutes.
+    headers = ["Expect:", f"Filename: {path.name}", "Content-Type: application/octet-stream",
+               f"X-Sha256: {file_sum}", "X-Artifact-Type: container-images", "X-Artifact-Format: tar",
+               "X-Artifact-Action: mirror", f"X-Bundle-Kind: {kind}", *extra]
+    status = run("curl", "--http1.1", "--fail", "--show-error", "--silent", "--connect-timeout", "15",
+                 "--max-time", str(max(3600, file_size // 1_000_000)), "--retry", "10", "--request", "POST",
+                 "--output", "/dev/null", "--write-out", "%{http_code}",
+                 *[item for header in headers for item in ("--header", header)], "--upload-file", str(path), url)
+    print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, {file_size} bytes, "
+          f"X-Sha256 {file_sum})")
+
+
 def notify(bundle, kind):
-    """POST the checksum, then the bundle, to NIFI_URL. The X- headers route it in NiFi, as the pypi mirror's do."""
-    url = os.environ.get("NIFI_URL")
-    if url:
-        parts = urllib.parse.urlsplit(url)
-        shown = parts._replace(netloc=parts.netloc.rpartition("@")[2]).geturl()  # no credentials in the log
-        for path, form in ((bundle.with_name(bundle.name + ".sha256"), "sha256"), (bundle, "tar")):
-            checksum = sha256(path)
-            # HTTP/1.1 keeps the header names as written; HTTP/2 would lowercase them and break
-            # a case-sensitive RouteOnAttribute.
-            status = run("curl", "--http1.1", "--fail", "--show-error", "--silent", "--connect-timeout", "15",
-                         "--max-time", "3600", "--retry", "2", "--request", "POST",
-                         "--output", "/dev/null", "--write-out", "%{http_code}",
-                         "--header", f"Filename: {path.name}", "--header", "Content-Type: application/octet-stream",
-                         "--header", f"X-Sha256: {checksum}", "--header", "X-Artifact-Type: container-images",
-                         "--header", f"X-Artifact-Format: {form}", "--header", "X-Artifact-Action: mirror",
-                         "--header", f"X-Bundle-Kind: {kind}", "--data-binary", f"@{path}", url)
-            print(f"posted to NiFi: {path.name} -> {shown} (HTTP {status.decode().strip()}, "
-                  f"{path.stat().st_size} bytes, X-Sha256 {checksum})")
+    """POST a written bundle to NIFI_URL. One file, one webhook on the high side: NiFi there verifies
+    X-Sha256 and writes the .sha256 beside the bundle in the store. A bundle over
+    MIRROR_BUNDLE_MAX_SIZE goes as <bundle>.part-001.. of at most that size (send() streams such a
+    bundle straight into parts when it does not also keep it for hand-carry); X-Bundle-Name,
+    X-Bundle-Sha256 and X-Bundle-Parts let the high side record the whole and import rejoin it."""
+    if not os.environ.get("NIFI_URL"):
+        return
+    checksum, size, cap = sha256(bundle), bundle.stat().st_size, bundle_cap()
+    count = -(-size // cap)
+    if count <= 1:
+        post_file(bundle, kind)
+        return
+    print(f"{bundle.name} is {size} bytes, over MIRROR_BUNDLE_MAX_SIZE ({cap}): sending {count} parts")
+    extra = (f"X-Bundle-Name: {bundle.name}", f"X-Bundle-Sha256: {checksum}", f"X-Bundle-Parts: {count}")
+    with bundle.open("rb") as whole:
+        for number in range(1, count + 1):
+            part = bundle.with_name(f"{bundle.name}.part-{number:03d}")
+            with part.open("wb") as out:  # one part on disk at a time
+                remaining = cap
+                while remaining and (block := whole.read(min(remaining, 8 * 1024 * 1024))):
+                    out.write(block)
+                    remaining -= len(block)
+            try:
+                post_file(part, kind, extra)
+            finally:
+                part.unlink()
 
 
 def sync(path, full=False):
@@ -630,7 +802,8 @@ def sync(path, full=False):
     settings(("NIFI_URL", "bundles are not posted to NiFi", False),
              ("MIRROR_BUNDLE_DIR", "bundles are not kept for hand-carry", False),
              ("MIRROR_LEDGER", "what was sent is kept only in MIRROR_STATE_DIR, which a CI job does not keep", False),
-             ("MIRROR_PLATFORM", "every platform of each image is sent", False))
+             ("MIRROR_PLATFORM", "every platform of each image is sent", False),
+             ("MIRROR_BUNDLE_MAX_SIZE", "bundles are split at 4GiB", False))
     images = catalog(path)
     if not images:
         raise MirrorError("catalog is empty; add an image before syncing")
@@ -715,7 +888,69 @@ def sync(path, full=False):
             save_state(state_file, state, remote=json.dumps(state, sort_keys=True) != loaded)
             print("nothing to send; low-side digests verified")
             return None
-        return send(work, state_file, state, low, changed, full, "full" if full else "delta")
+        return send_batches(work, state_file, state, low, changed, full, "full" if full else "delta")
+
+
+def bundle_cap():
+    """MIRROR_BUNDLE_MAX_SIZE in bytes: a plain number or with KiB, MiB, GiB or TiB."""
+    text = os.environ.get("MIRROR_BUNDLE_MAX_SIZE", "").strip() or "4GiB"
+    match = re.fullmatch(r"([0-9]+)\s*(KiB|MiB|GiB|TiB)?", text, re.IGNORECASE)
+    if not match or not int(match[1]):
+        raise MirrorError(f"MIRROR_BUNDLE_MAX_SIZE must be bytes or a number with KiB, MiB, GiB or TiB, not {text!r}")
+    return int(match[1]) * 1024 ** ["", "kib", "mib", "gib", "tib"].index((match[2] or "").lower())
+
+
+def image_bytes(reference, side):
+    """The bytes skopeo copy --all moves for reference (by digest): each manifest, config and layer once."""
+    seen, total = set(), 0
+    pending = [reference]
+    while pending:
+        current = pending.pop()
+        raw = run("skopeo", "inspect", "--raw", *options(side), current)
+        manifest = json.loads(raw)
+        total += len(raw)
+        for child in manifest.get("manifests", []):
+            if child["digest"] not in seen:
+                seen.add(child["digest"])
+                pending.append(current.rsplit("@", 1)[0] + "@" + child["digest"])
+        for blob in [manifest.get("config") or {}, *manifest.get("layers", [])]:
+            if blob.get("digest") and blob["digest"] not in seen:
+                seen.add(blob["digest"])
+                total += int(blob.get("size", 0))
+    return total
+
+
+def batches(images, low):
+    """Split images into bundles of at most MIRROR_BUNDLE_MAX_SIZE, in catalog order. A store,
+    NiFi or link limit then applies to one bundle, and the runner holds one bundle at a time.
+    An image larger than the cap travels alone."""
+    cap, groups, size = bundle_cap(), [[]], 0
+    for image in images:
+        try:
+            need = image_bytes(f"docker://{low}/{image['target']}@{image['transfer']}", "TARGET_REGISTRY")
+        except MirrorError:  # a resend of an image the target registry lost: ask the source
+            upstream = transport_reference(image["source"]).rsplit("@", 1)[0]
+            need = image_bytes(f"docker://{upstream}@{image['transfer']}", side_of(upstream))
+        if need > cap:
+            print(f"{image['target']}:{image['tag']} is {need} bytes, over MIRROR_BUNDLE_MAX_SIZE ({cap}): "
+                  "it goes in a bundle of its own, sent in parts")
+        if groups[-1] and size + need > cap:
+            groups.append([])
+            size = 0
+        groups[-1].append(image)
+        size += need
+    if len(groups) > 1:
+        print(f"{len(images)} image(s) split into {len(groups)} bundles of at most {cap} bytes")
+    return groups
+
+
+def send_batches(work, state_file, state, low, changed, full, kind, bridges=None):
+    """send() each size-capped batch in turn. Only the first may be full or bridge a gap: the high
+    side accepts that one over a gap and the rest follow it in sequence."""
+    bundle = None
+    for number, batch in enumerate(batches(changed, low)):
+        bundle = send(work, state_file, state, low, batch, full and not number, kind, None if number else bridges)
+    return bundle
 
 
 def bundle_destination():
@@ -731,6 +966,12 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
     platform = os.environ.get("MIRROR_PLATFORM", "").strip()
     outbox = Path(os.environ.get("MIRROR_BUNDLE_DIR") or work / "bundles")
     outbox.mkdir(parents=True, exist_ok=True)
+    if not os.environ.get("MIRROR_BUNDLE_DIR"):
+        # Bundles or parts a failed run left behind are never sent: its sequence was reserved, so this
+        # run is full and carries their images again.
+        for stale in outbox.glob("mirror-*"):
+            print(f"removed {stale.name}: left by a run that did not deliver it")
+            stale.unlink()
     # Reserve a sequence before publishing. An interrupted run forces the next one full.
     state.update(sequence=state["sequence"] + 1, pending=True)
     save_state(state_file, state)
@@ -761,27 +1002,38 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
                 verify_platform(directory, image)
         write_json(stage / "images.json", metadata)
         bundle = outbox / f"mirror-{state['stream']}-{state['sequence']:012d}.tar"
-        temporary_bundle = bundle.with_suffix(".tmp")
-        with tarfile.open(temporary_bundle, "w") as archive:
-            for item in sorted(stage.rglob("*")):
-                if item.is_file():
-                    archive.add(item, arcname=str(item.relative_to(stage)), recursive=False)
-        os.replace(temporary_bundle, bundle)
-        sidecar = bundle.with_name(bundle.name + ".sha256")
-        temporary_sidecar = sidecar.with_suffix(".tmp")
-        temporary_sidecar.write_text(f"{sha256(bundle)}  {bundle.name}\n")
-        os.replace(temporary_sidecar, sidecar)  # readiness marker, published last
-    if ledger_enabled():
-        created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        record = metadata | {"created": created, "kind": kind, "bundle": bundle.name}
-        package_put(LEDGER, f"{state['sequence']:012d}", "images.json",
-                    json.dumps(record, indent=2, sort_keys=True).encode())
-    size = bundle.stat().st_size
-    notify(bundle, kind)
-    if os.environ.get("NIFI_URL"):
-        # Delivered: the images stay in the target registry and the record in the ledger, so nothing stays on the runner.
-        for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
-            path.unlink()
+        streamed = None
+        if os.environ.get("NIFI_URL") and not os.environ.get("MIRROR_BUNDLE_DIR"):
+            # Measure first: a bundle over the cap goes to NiFi as parts straight from the tar writer,
+            # so the runner never holds the whole tar beside the staged images.
+            measure = TarSink()
+            write_tar(stage, measure)
+            if measure.size > bundle_cap():
+                streamed = measure
+        if streamed is None:
+            temporary_bundle = bundle.with_suffix(".tmp")
+            with temporary_bundle.open("wb") as stream:
+                write_tar(stage, stream)
+            os.replace(temporary_bundle, bundle)
+            sidecar = bundle.with_name(bundle.name + ".sha256")
+            temporary_sidecar = sidecar.with_suffix(".tmp")
+            temporary_sidecar.write_text(f"{sha256(bundle)}  {bundle.name}\n")
+            os.replace(temporary_sidecar, sidecar)  # readiness marker, published last
+        else:
+            if ledger_enabled():  # recorded before the first part leaves, as for a whole bundle
+                record_ledger(state, metadata, kind, bundle.name)
+            post_parts(stage, bundle, streamed, kind)
+    if streamed is None:
+        if ledger_enabled():
+            record_ledger(state, metadata, kind, bundle.name)
+        size = bundle.stat().st_size
+        notify(bundle, kind)
+        if os.environ.get("NIFI_URL"):
+            # Delivered: the images stay in the target registry and the record in the ledger, so nothing stays on the runner.
+            for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
+                path.unlink()
+    else:
+        size = streamed.size
     if kind != "resend":  # a resend repeats what the ledger already records
         state["sent"].update({f"{i['target']}:{i['tag']}": f"{i['digest']} {platform}".strip() for i in changed})
         aliases = state.setdefault("aliases", {})
@@ -795,6 +1047,84 @@ def send(work, state_file, state, low, changed, full, kind, bridges=None):
     print(f"bundle: {bundle.name} ({len(changed)} image(s), {size} bytes)"
           + (", delivered and removed" if os.environ.get("NIFI_URL") else f", left in {bundle.parent}"))
     return bundle
+
+
+def record_ledger(state, metadata, kind, name):
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record = metadata | {"created": created, "kind": kind, "bundle": name}
+    package_put(LEDGER, f"{state['sequence']:012d}", "images.json", json.dumps(record, indent=2, sort_keys=True).encode())
+
+
+def write_tar(stage, stream):
+    """The bundle's tar, in a fixed order, so writing it twice gives the same bytes."""
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        for item in sorted(stage.rglob("*")):
+            if item.is_file():
+                archive.add(item, arcname=str(item.relative_to(stage)), recursive=False)
+
+
+class TarSink:
+    """A write-only file that keeps only the size and sha256 of what passes through."""
+
+    def __init__(self):
+        self.size, self.digest = 0, hashlib.sha256()
+
+    def write(self, data):
+        self.size += len(data)
+        self.digest.update(data)
+        return len(data)
+
+    def tell(self):
+        return self.size
+
+
+class PartSink(TarSink):
+    """Writes the tar into part files of at most cap bytes, handing each to post() once full."""
+
+    def __init__(self, directory, name, cap, post):
+        super().__init__()
+        self.directory, self.name, self.cap, self.post = directory, name, cap, post
+        self.number, self.current, self.filled = 0, None, 0
+
+    def write(self, data):
+        view = memoryview(data)
+        while view:
+            if self.current is None:
+                self.number += 1
+                self.current = (self.directory / f"{self.name}.part-{self.number:03d}").open("wb")
+                self.filled = 0
+            taken = view[:self.cap - self.filled]
+            self.current.write(taken)
+            self.filled += len(taken)
+            view = view[len(taken):]
+            if self.filled == self.cap:
+                self.flush_part()
+        return super().write(data)
+
+    def flush_part(self):
+        if self.current is not None:
+            self.current.close()
+            path = Path(self.current.name)
+            self.current = None
+            try:
+                self.post(path)
+            finally:
+                path.unlink(missing_ok=True)
+
+
+def post_parts(stage, bundle, measured, kind):
+    """Send a bundle over the cap as parts written straight from the tar, one part on disk at a time.
+    The first pass gave the size and checksum every part carries; this pass must match it."""
+    cap = bundle_cap()
+    count = -(-measured.size // cap)
+    checksum = measured.digest.hexdigest()
+    print(f"{bundle.name} is {measured.size} bytes, over MIRROR_BUNDLE_MAX_SIZE ({cap}): streaming {count} parts")
+    extra = (f"X-Bundle-Name: {bundle.name}", f"X-Bundle-Sha256: {checksum}", f"X-Bundle-Parts: {count}")
+    sink = PartSink(bundle.parent, bundle.name, cap, lambda path: post_file(path, kind, extra))
+    write_tar(stage, sink)
+    sink.flush_part()
+    if (sink.size, sink.digest.hexdigest()) != (measured.size, checksum):
+        raise MirrorError(f"{bundle.name}: the streamed tar differs from the measured one; the parts sent are unusable")
 
 
 def sequence_range(text, last):
@@ -849,7 +1179,66 @@ def resend(since=None, sequences=None, image=None):
             print(f"resend: {item['target']}:{', :'.join(item['tags'])} {item['transfer']}")
         # Everything recorded from the first match to the newest bundle stands in for those bundles.
         bridges = matched[0] if not image and final >= state["sequence"] else None
-        return send(work, state_file, state, low, chosen, False, "resend", bridges)
+        return send_batches(work, state_file, state, low, chosen, False, "resend", bridges)
+
+
+BUNDLE_ENTRY = re.compile(r"images\.json|images/sha256-[0-9a-f]{64}/(?:version|manifest\.json|signature-[0-9]+|"
+                          r"[0-9a-f]{64}(?:\.manifest\.json)?)")
+
+
+class PartReader(io.RawIOBase):
+    """The parts of a bundle read as one stream, hashed as they pass. Each part is fetched only when
+    the reader reaches it and deleted once read, so the job holds one part, not the joined bundle."""
+
+    def __init__(self, fetch, names, scratch):
+        super().__init__()
+        self.fetch, self.names, self.scratch = fetch, list(names), scratch
+        self.digest, self.current, self.number = hashlib.sha256(), None, 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        while True:
+            if self.current is None:
+                if self.number == len(self.names):
+                    return 0
+                path = self.scratch / "part.download"
+                if not self.fetch(self.names[self.number], path):
+                    raise MirrorError(f"{self.names[self.number]} disappeared from the store during import")
+                self.current, self.number = path.open("rb"), self.number + 1
+            count = self.current.readinto(buffer)
+            if count:
+                self.digest.update(memoryview(buffer)[:count])
+                return count
+            self.current.close()
+            (self.scratch / "part.download").unlink()
+            self.current = None
+
+    def close(self):
+        if self.current is not None:  # an extract that failed part way leaves a part open
+            self.current.close()
+            (self.scratch / "part.download").unlink(missing_ok=True)
+            self.current = None
+        super().close()
+
+
+def extract_stream(stream, directory):
+    """Unpack a bundle read front to back (no seeking), with the same entry rules as extract."""
+    seen = set()
+    with tarfile.open(fileobj=stream, mode="r|") as archive:
+        for member in archive:
+            if not member.isfile() or not BUNDLE_ENTRY.fullmatch(member.name) or member.name in seen:
+                raise MirrorError(f"unsafe or duplicate bundle entry: {member.name}")
+            seen.add(member.name)
+            if member.size > shutil.disk_usage(directory).free:
+                raise MirrorError("insufficient space to unpack bundle")
+            target = directory / member.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(member) as source, target.open("wb") as dest:
+                shutil.copyfileobj(source, dest)
+    while stream.read(1 << 20):  # tar padding after the end marker still counts toward the checksum
+        pass
 
 
 def extract(bundle, directory):
@@ -900,17 +1289,25 @@ def validate_manifest(manifest):
         seen.add(key)
 
 
-def import_one(bundle, adopt_stream=False, superseded_ok=False, record=None):
+def import_one(bundle, adopt_stream=False, superseded_ok=False, record=None, unpack=None):
+    """Verify a bundle and push its images. unpack(stage) streams a bundle that came in parts into
+    stage and returns its sha256; the checksum is then compared before anything is pushed."""
     high = registry("TARGET_REGISTRY")
     work = state_path("IMPORT_STATE_DIR", "registry-mirror-import")
     sidecar = bundle.with_name(bundle.name + ".sha256")
-    fields = sidecar.read_text().split() if sidecar.exists() else []
-    digest = sha256(bundle)
-    if fields != [digest, bundle.name]:
-        raise MirrorError(f"{bundle.name}: missing or mismatched checksum")
+    fields = sidecar.read_text().split()[:2] if sidecar.exists() else []
+    if unpack is None:
+        digest = sha256(bundle)
+        if fields != [digest, bundle.name]:
+            raise MirrorError(f"{bundle.name}: missing or mismatched checksum")
     with locked(work), tempfile.TemporaryDirectory(dir=work) as temporary:
         stage = Path(temporary)
-        extract(bundle, stage)
+        if unpack is None:
+            extract(bundle, stage)
+        else:
+            digest = unpack(stage)
+            if fields != [digest, bundle.name]:
+                raise MirrorError(f"{bundle.name}: the joined parts do not match the bundle checksum")
         manifest = json.loads((stage / "images.json").read_text())
         validate_manifest(manifest)
         for image in manifest["images"]:
@@ -943,14 +1340,16 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False, record=None):
                               f"RESEND_SEQUENCE={previous + 1}.. (mirror.py resend --sequence {previous + 1}..)")
         pushed = []
         for image in manifest["images"]:
+            target = rewrite(image["target"], "IMPORT_PATH_REWRITE")
+            moved = f" (sent as {image['target']}, IMPORT_PATH_REWRITE)" if target != image["target"] else ""
             for tag in image["tags"]:
-                destination = f"docker://{high}/{image['target']}:{tag}"
+                destination = f"docker://{high}/{target}:{tag}"
                 copy(f"dir:{stage / 'images' / image['transfer'].replace(':', '-')}", destination,
                      destination_side="TARGET_REGISTRY")
                 if raw_digest(destination, "TARGET_REGISTRY") != image["transfer"]:
-                    raise MirrorError(f"high mirror digest mismatch: {image['target']}:{tag}")
-                print(f"pushed to target registry: {high}/{image['target']}:{tag}@{image['transfer']}")
-                pushed.append({"target": image["target"], "tag": tag, "digest": image["transfer"]})
+                    raise MirrorError(f"high mirror digest mismatch: {target}:{tag}")
+                print(f"pushed to target registry: {high}/{target}:{tag}@{image['transfer']}{moved}")
+                pushed.append({"target": target, "tag": tag, "digest": image["transfer"]})
         if record:
             record.write_text(json.dumps(json.loads(record.read_text()) + pushed, indent=2) + "\n")
         save_receipt(receipt_file, {"stream": manifest["stream"], "sequence": manifest["sequence"],
@@ -990,7 +1389,9 @@ def import_registry(name=None, adopt_stream=False, record=None):
     settings(("IMPORT_STORE", "bundles are read from this project's package registry (gitlab)", False),
              ("MIRROR_LEDGER", "the receipt is kept only in IMPORT_STATE_DIR, which a CI job does not keep", False),
              ("IMPORT_DELETE_BUNDLES", "imported bundles stay in the store", False),
-             ("PACKAGE_TOKEN", "the job token is used; GitLab refuses it a package delete", True))
+             ("PACKAGE_TOKEN", "the job token is used; GitLab refuses it a package delete", True),
+             ("IMPORT_PATH_REWRITE", "images land at the path the low side sent", False),
+             ("IMPORT_GAP_GRACE", "a later bundle waits 6 h for an earlier one before import fails", False))
     if cleanup and not s3_enabled() and not os.environ.get("PACKAGE_TOKEN"):
         # Checked before importing: a job token reads packages but GitLab refuses it a delete (HTTP 403).
         raise MirrorError("IMPORT_DELETE_BUNDLES with the package registry needs PACKAGE_TOKEN "
@@ -1001,28 +1402,57 @@ def import_registry(name=None, adopt_stream=False, record=None):
 
     removed = set()
 
-    def remove(stem):
+    def remove(stem, names=None):
         if stem in removed:
             return
         removed.add(stem)
         if not cleanup:
             print(f"kept in the store: {stem} (IMPORT_DELETE_BUNDLES is not true)")
-        elif store_delete(BUNDLES, stem, [f"{stem}.tar", f"{stem}.tar.sha256"]):
+            return
+        if names is None:  # a leftover: its checksum file says whether it came in parts
+            sidecar = store_get(BUNDLES, stem, f"{stem}.tar.sha256")
+            if sidecar is None:  # S3 reports success for a missing object, so ask first
+                print(f"nothing to delete in the store: {stem}")
+                return
+            fields = sidecar.decode().split()
+            count = int(fields[2]) if len(fields) == 3 and fields[2].isdigit() else 0
+            names = [f"{stem}.tar.part-{n:03d}" for n in range(1, count + 1)] or [f"{stem}.tar"]
+        if store_delete(BUNDLES, stem, [*names, f"{stem}.tar.sha256"]):
             print(f"deleted from the store: {stem}")
         else:
             print(f"nothing to delete in the store: {stem}")
 
     def consume(stem, quiet=False):
         bundle = downloads / f"{stem}.tar"
-        for path in (bundle.with_name(bundle.name + ".sha256"), bundle):
-            if not store_get(BUNDLES, stem, path.name, path):
-                if not quiet:
-                    print(f"waiting for {path.name}")
+        sidecar = bundle.with_name(bundle.name + ".sha256")
+        if not store_get(BUNDLES, stem, sidecar.name, sidecar):
+            if not quiet:
+                print(f"waiting for {sidecar.name}")
+            return False
+        # NiFi writes "<sha256>  <bundle>.tar" and, for a bundle sent in parts, the number of parts.
+        fields = sidecar.read_text().split()
+        count = int(fields[2]) if len(fields) == 3 and fields[2].isdigit() else 0
+        names = [f"{bundle.name}.part-{n:03d}" for n in range(1, count + 1)] or [bundle.name]
+        unpack = None
+        if count:
+            missing = [name for name in names if not store_exists(BUNDLES, stem, name)]
+            if missing:
+                print(f"waiting for {', '.join(missing)} ({len(missing)} of {count} parts)")
                 return False
-        import_one(bundle, adopt_stream, superseded_ok=True, record=record)
-        for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
-            path.unlink()
-        remove(stem)  # its images are in the target registry and the receipt has moved past it
+
+            def unpack(stage):
+                with PartReader(lambda name, path: store_get(BUNDLES, stem, name, path), names, downloads) as reader:
+                    extract_stream(io.BufferedReader(reader, 8 * 1024 * 1024), stage)
+                print(f"read {count} parts of {bundle.name} in order, one on disk at a time")
+                return reader.digest.hexdigest()
+        elif not store_get(BUNDLES, stem, bundle.name, bundle):
+            if not quiet:
+                print(f"waiting for {bundle.name}")
+            return False
+        import_one(bundle, adopt_stream, superseded_ok=True, record=record, unpack=unpack)
+        for path in (bundle, sidecar):
+            path.unlink(missing_ok=True)
+        remove(stem, names)  # its images are in the target registry and the receipt has moved past it
         return True
 
     match = BUNDLE_NAME.fullmatch(name or "")
@@ -1047,7 +1477,19 @@ def import_registry(name=None, adopt_stream=False, record=None):
             else:
                 print(f"not checking the store for {match[1]}: IMPORT_DELETE_BUNDLES is not true")
         else:
-            consume(match[1])
+            try:
+                consume(match[1])
+            except SequenceGap as gap:
+                # Bundles cross the link in any order. A later one waits in the store and the catch-up
+                # above imports it when the earlier one arrives; only a long wait means one was lost.
+                waited, grace = store_age(BUNDLES, match[1], f"{match[1]}.tar"), gap_grace()
+                if waited is None or waited >= grace:
+                    age = "for an unknown time" if waited is None else f"for {waited:.1f} h"
+                    raise SequenceGap(f"{gap} [{match[1]}.tar has waited {age}; IMPORT_GAP_GRACE is {grace:g} h]") \
+                        from None
+                raise GapWaiting(f"{match[1]}.tar is stored and imports when the earlier bundle arrives "
+                                 f"(waited {waited:.1f} h of IMPORT_GAP_GRACE {grace:g} h). If it never "
+                                 f"arrives: {gap}") from None
 
 
 def promote(record):
@@ -1057,6 +1499,7 @@ def promote(record):
     that were imported and approved, whatever the dev tags point at by now.
     """
     dev, prod = registry("SOURCE_REGISTRY"), registry("TARGET_REGISTRY")
+    settings(("PROMOTE_PATH_REWRITE", "images keep their dev path in prod", False))
     if dev == prod:
         raise MirrorError("SOURCE_REGISTRY and TARGET_REGISTRY are the same registry; nothing to promote")
     images = {}
@@ -1072,6 +1515,7 @@ def promote(record):
         source = f"docker://{dev}/{entry['target']}@{entry['digest']}"
         if raw_digest(source, "SOURCE_REGISTRY") != entry["digest"]:
             raise MirrorError(f"digest mismatch in SOURCE_REGISTRY: {dev}/{entry['target']}@{entry['digest']}")
+        key = f"{rewrite(entry['target'], 'PROMOTE_PATH_REWRITE')}:{entry['tag']}"
         destination = f"docker://{prod}/{key}"
         copy(source, destination, "SOURCE_REGISTRY", "TARGET_REGISTRY")
         if raw_digest(destination, "TARGET_REGISTRY") != entry["digest"]:
@@ -1181,6 +1625,7 @@ EXAMPLES = """
 Low side (pull from the source, save to your registry, send bundles):
   TARGET_REGISTRY=registry.low.example.com mirror.py login
   mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus
+  mirror.py add-list lists/ --prefix team   # every image in lists/*.txt
   mirror.py sync                      # NIFI_URL set: bundle posted to NiFi
   mirror.py resend --sequence 7..     # the high side reported bundle 7 missing
 
@@ -1229,6 +1674,14 @@ def main(argv=None):
     resend_command.add_argument("--since", help="images recorded on or after YYYY-MM-DD")
     resend_command.add_argument("--sequence", help="bundles N, N.. (to the newest) or N..M")
     resend_command.add_argument("--image", help="one target, repo or repo:tag")
+    add_list_command = command(
+        "add-list", "add every image named in a folder of .txt files, keeping images.txt sorted",
+        "  mirror.py add-list lists/                 # docker.io/prom/prometheus:v3.13.4 -> prom/prometheus\n"
+        "  mirror.py add-list lists/ --prefix team   # -> team/prom/prometheus\n"
+        "  lists/*.txt hold one image per line, # comments allowed. A line without a registry host\n"
+        "  is read as docker pull reads it (alpine -> docker.io/library/alpine); without a tag, :latest.")
+    add_list_command.add_argument("folder", type=Path, help="a directory of *.txt files")
+    add_list_command.add_argument("--prefix", help="repository path the targets go under, e.g. team")
     command("pending", "list catalog sources the ledger has not sent yet, one per line", "  mirror.py pending")
     check = command("covers", "fail when a Containerfile or manifest uses an image the mirror lacks",
                     "  mirror.py covers Containerfile\n  helm template chart/ | mirror.py covers -")
@@ -1266,6 +1719,8 @@ def main(argv=None):
             sync(args.catalog, args.all)
         elif args.command == "resend":
             resend(args.since, args.sequence, args.image)
+        elif args.command == "add-list":
+            add_list(args.catalog, args.folder, args.prefix)
         elif args.command == "pending":
             pending(args.catalog)
         elif args.command == "covers":
@@ -1282,6 +1737,9 @@ def main(argv=None):
             else:
                 import_one(args.bundle, args.adopt_stream, record=args.record)
         return 0
+    except GapWaiting as waiting:
+        print(f"waiting: {waiting}", file=sys.stderr)
+        return 3
     except (MirrorError, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

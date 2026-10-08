@@ -124,8 +124,9 @@ bundle 9 arrives.
 
 - A missed pipeline trigger: the next import fetches every later bundle the receipt points
   to, in order.
-- A bundle whose two files arrive apart, or bundles out of order: import prints `waiting for`
-  and the next trigger imports them.
+- A bundle whose parts arrive apart, or bundles out of order: import prints `waiting` (the
+  pipeline shows a warning) and the trigger that brings the missing file imports them in order.
+  A gap that lasts longer than `IMPORT_GAP_GRACE` hours fails with the resend instruction.
 - A duplicate or late trigger: `already imported` or `superseded`, nothing pushed.
 
 A bundle lost on the way cannot heal on the high side: the link is one-way, so it cannot ask

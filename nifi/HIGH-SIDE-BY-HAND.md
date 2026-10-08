@@ -44,24 +44,27 @@ the digest the low side approved. `skopeo copy --preserve-digests` keeps it, and
 
 ## What arrives
 
-The low side POSTs two files per bundle to NiFi, each with these attributes:
+The low side POSTs one file per bundle to NiFi. A bundle larger than the low project's
+`MIRROR_BUNDLE_MAX_SIZE` (4 GiB by default) arrives instead as parts of at most that size,
+one POST each. Every file carries these attributes:
 
 | Attribute | Value |
 |---|---|
-| `filename` | `mirror-<stream>-<sequence>.tar` or the same name plus `.sha256` |
+| `filename` | `mirror-<stream>-<sequence>.tar`, or `mirror-<stream>-<sequence>.tar.part-001` and so on |
 | `X-Sha256` | SHA-256 of this file |
 | `X-Artifact-Type` | `container-images` |
-| `X-Artifact-Format` | `tar` or `sha256` |
+| `X-Artifact-Format` | `tar` |
 | `X-Artifact-Action` | `mirror` |
 | `X-Bundle-Kind` | `delta`, `full` or `resend` |
+| `X-Bundle-Name`, `X-Bundle-Sha256`, `X-Bundle-Parts` | a part only: the whole bundle's file name, SHA-256 and number of parts |
 
 The flow below starts where your pypi flow starts: at the RouteOnAttribute that sees
 these attributes. If your link delivers bare files and the attributes travel inside a
 FlowFile package, put the same unpack step in front that the pypi feed uses.
 
-Both files of a bundle go to GitLab unchanged. Unlike the pypi flow there is no unpack
-of the content and no UpdateAttribute for names: the file name already carries the
-package version.
+Each file goes to GitLab unchanged. The flow then writes the bundle's checksum file,
+`<bundle>.tar.sha256`, from the attributes it has just verified, and starts one pipeline.
+Import reads that checksum file to know whether the bundle came whole or in parts.
 
 ## Part 1: parameter context
 
@@ -104,9 +107,11 @@ Type **RouteOnAttribute**.
 | Property | Value |
 |---|---|
 | Routing Strategy | `Route to Property name` (default) |
-| `container-images` *(add)* | `${X-Artifact-Type:equals('container-images'):and(${X-Artifact-Action:equals('mirror')}):and(${filename:matches('mirror-[0-9a-f]{32}-[0-9]{12}[.]tar([.]sha256)?')})}` |
+| `container-images` *(add)* | `${X-Artifact-Type:equals('container-images'):and(${X-Artifact-Action:equals('mirror')}):and(${filename:matches('mirror-[0-9a-f]{32}-[0-9]{12}[.]tar([.]part-[0-9]{3})?')})}` |
+| `old-checksum` *(add)* | `${filename:matches('mirror-[0-9a-f]{32}-[0-9]{12}[.]tar[.]sha256')}` |
 
-Auto-terminate: `unmatched`, or wire it to your other feeds.
+Auto-terminate: `old-checksum` (a low side that still sends a `.sha256` file: this flow
+writes its own) and `unmatched`, or wire `unmatched` to your other feeds.
 
 ### 2. Hash file
 
@@ -176,20 +181,50 @@ Then the processor. Type **PutS3Object**.
 | Endpoint Override URL | `https://<store>:<port>` |
 | Use Path Style Access | `true` |
 
-Auto-terminate: none. In Part 4, connect `success` to **Start the import pipeline** and
+Auto-terminate: none. In Part 4, connect `success` to **Name the checksum** and
 `failure` to **Rejected (inspect queue)**, in place of rows 7 to 9.
 
 Give the bucket a lifecycle rule that expires `registry-mirror-bundles/` after a few days, or set
 `IMPORT_DELETE_BUNDLES=true` on the high project. Never expire `registry-mirror-receipt/`.
 
-### 5. Start the import pipeline
+### 5. Name the checksum
+
+Type **UpdateAttribute**.
+
+| Property | Value |
+|---|---|
+| `bundle.name` *(add)* | `${X-Bundle-Name:replaceNull(${filename})}` |
+| `filename` *(add)* | `${X-Bundle-Name:replaceNull(${filename})}.sha256` |
+
+Auto-terminate: none.
+
+### 6. Write the checksum
+
+Type **ReplaceText**.
+
+| Property | Value |
+|---|---|
+| Replacement Strategy | `Always Replace` |
+| Evaluation Mode | `Entire text` |
+| Replacement Value | `${X-Bundle-Sha256:replaceNull(${X-Sha256})}  ${bundle.name}${X-Bundle-Parts:isNull():ifElse('', ${X-Bundle-Parts:prepend('  ')})}` followed by a newline (Shift+Enter) |
+
+Auto-terminate: `failure`. The content becomes `<sha256>  <bundle>.tar`, with the number
+of parts after it for a bundle sent in parts.
+
+### 7. Upload the checksum
+
+A second processor configured exactly like **Upload to GitLab** (or **Upload to S3**),
+named `Upload the checksum`. The URL or Object Key needs no change: it is built from
+`filename`, which step 5 set to the checksum file.
+
+### 8. Start the import pipeline
 
 Type **InvokeHTTP**.
 
 | Property | Value |
 |---|---|
 | HTTP Method | `POST` |
-| HTTP URL | `#{gitlab.api.url}/projects/#{gitlab.container.projectId}/pipeline?ref=#{gitlab.container.branch}&variables%5B%5D%5Bkey%5D=BUNDLE&variables%5B%5D%5Bvalue%5D=${filename:urlEncode()}` |
+| HTTP URL | `#{gitlab.api.url}/projects/#{gitlab.container.projectId}/pipeline?ref=#{gitlab.container.branch}&variables%5B%5D%5Bkey%5D=BUNDLE&variables%5B%5D%5Bvalue%5D=${bundle.name:urlEncode()}` |
 | Request Body Enabled | `false` |
 | Response Body Attribute Name | `gitlab.response` |
 | `PRIVATE-TOKEN` *(add, sensitive)* | `#{gitlab.container.token}` |
@@ -197,15 +232,15 @@ Type **InvokeHTTP**.
 Auto-terminate: `Response`. Type the `%5B%5D` sequences as shown: they are `[]`,
 encoded.
 
-Each of a bundle's two files starts one pipeline. Whichever runs first while the other
-file is missing prints `waiting for` and exits cleanly. The second imports the bundle,
-or reports `already imported`.
+Each file starts one pipeline: one per bundle, or one per part. A pipeline that runs
+before every part has arrived prints `waiting for ... parts` and exits cleanly; the last
+part's pipeline imports the bundle and the rest report `already imported`.
 
-### 6. Delivered
+### 9. Delivered
 
 Type **UpdateAttribute**, no properties. Auto-terminate: `success`.
 
-### 7. Rejected (inspect queue)
+### 10. Rejected (inspect queue)
 
 Type **UpdateAttribute**, no properties. Auto-terminate: `success`. Keep it
 **stopped**, so anything that failed waits in its input queue for you.
@@ -224,25 +259,33 @@ arrow away and back onto the same processor.
 | 4 | Hash file | `failure` | Rejected (inspect queue) |
 | 5 | File matches X-Sha256 | `verified` | Upload to GitLab |
 | 6 | File matches X-Sha256 | `unmatched` | Rejected (inspect queue) |
-| 7 | Upload to GitLab | `Original` | Start the import pipeline |
+| 7 | Upload to GitLab | `Original` | Name the checksum |
 | 8 | Upload to GitLab | `Retry` | Upload to GitLab (itself) |
 | 9 | Upload to GitLab | `No Retry`, `Failure` | Rejected (inspect queue) |
-| 10 | Start the import pipeline | `Original` | Delivered |
-| 11 | Start the import pipeline | `Retry` | Start the import pipeline (itself) |
-| 12 | Start the import pipeline | `No Retry`, `Failure` | Rejected (inspect queue) |
+| 10 | Name the checksum | `success` | Write the checksum |
+| 11 | Write the checksum | `success` | Upload the checksum |
+| 12 | Upload the checksum | `Original` | Start the import pipeline |
+| 13 | Upload the checksum | `Retry` | Upload the checksum (itself) |
+| 14 | Upload the checksum | `No Retry`, `Failure` | Rejected (inspect queue) |
+| 15 | Start the import pipeline | `Original` | Delivered |
+| 16 | Start the import pipeline | `Retry` | Start the import pipeline (itself) |
+| 17 | Start the import pipeline | `No Retry`, `Failure` | Rejected (inspect queue) |
+
+With S3, both uploads connect `success` onward and `failure` to **Rejected (inspect queue)**
+in place of the `Original`, `Retry` and `No Retry`/`Failure` rows.
 
 ## Part 5: check and start
 
 1. Every processor except the two end points shows a stopped square, not a warning
    triangle. Hover a triangle to read what is missing.
-2. On both InvokeHTTP processors, the only deletable property row is `PRIVATE-TOKEN`.
+2. On every InvokeHTTP processor, the only deletable property row is `PRIVATE-TOKEN`.
    A mistyped built-in property also shows as a deletable row.
 3. Select everything except **Rejected (inspect queue)**, right-click > **Start**.
 4. On the low side, run the low project's pipeline. Its `sync` log names what it sent:
    `posted to NiFi: mirror-<stream>-<n>.tar -> <url> (HTTP 200, ...)`.
-5. Watch the queues. Two flowfiles reach **Delivered**, nothing reaches **Rejected**.
+5. Watch the queues. One flowfile per bundle (or part) reaches **Delivered**, nothing reaches **Rejected**.
 6. In the high project, **Deploy > Package registry** shows `registry-mirror-bundles` with that
-   version, and **Build > Pipelines** shows two pipelines. The `import` log names each
+   version (the `.tar` or its parts, and the `.sha256`), and **Build > Pipelines** shows one pipeline per file. The `import` log names each
    image as `pushed to high registry: <host>/<repo>:<tag>@sha256:...`.
 7. Pull that exact path to prove it: `podman pull <host>/<repo>:<tag>@sha256:...`
 

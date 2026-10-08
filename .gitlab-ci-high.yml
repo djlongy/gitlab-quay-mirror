@@ -29,6 +29,10 @@ import:
     name: dev
     deployment_tier: development
   resource_group: registry-mirror-high
+  # Exit 3: a later bundle is stored and waits for an earlier one still crossing the link. The job
+  # shows as a warning; it fails once the wait passes IMPORT_GAP_GRACE (hours, default 6).
+  allow_failure:
+    exit_codes: [3]
   needs:
     - job: verify
       artifacts: false
@@ -41,10 +45,13 @@ import:
     - python3 mirror.py login
     - |
       if [ -n "${IMPORT_INBOX_DIR:-}" ]; then
-        python3 mirror.py import --inbox "$IMPORT_INBOX_DIR" --record imported.json
+        python3 mirror.py import --inbox "$IMPORT_INBOX_DIR" --record imported.json || status=$?
       else
-        python3 mirror.py import --registry ${BUNDLE:+--name "$BUNDLE"} --record imported.json
+        python3 mirror.py import --registry ${BUNDLE:+--name "$BUNDLE"} --record imported.json || status=$?
       fi
+      # The runner reports any failing command as exit code 1. Exiting with mirror.py's own code
+      # lets allow_failure tell a bundle that is waiting (3) from a failure.
+      exit "${status:-0}"
   after_script:
     - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/.import-work"
   artifacts:
