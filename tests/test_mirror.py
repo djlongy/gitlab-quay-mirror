@@ -80,6 +80,18 @@ class MirrorTest(unittest.TestCase):
         sizing = mock.patch.object(mirror, 'image_bytes', return_value=1)
         sizing.start()
         self.addCleanup(sizing.stop)
+        # CI runs send straight after sync: unless a test says otherwise, each written bundle is delivered.
+        self.write_only = mirror.write_bundle
+
+        def written_and_sent(work, out, state_file, state, *rest, **named):
+            bundle = self.write_only(work, out, state_file, state, *rest, **named)
+            (out / (bundle.name + '.send.json')).unlink()
+            state['pending'] = False
+            mirror.save_state(state_file, state)
+            return bundle
+        delivered = mock.patch.object(mirror, 'write_bundle', side_effect=written_and_sent)
+        delivered.start()
+        self.addCleanup(delivered.stop)
 
     def test_catalog_requires_a_digest_and_an_org_and_repository(self):
         pinned = 'docker.io/library/alpine:3.20@sha256:' + 'a'*64
@@ -667,7 +679,7 @@ class MirrorTest(unittest.TestCase):
                 mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
                 mock.patch.object(mirror, 'verify_image'):
             path.write_text(entries['latest'] + entries['pin'])
-            with mock.patch.object(mirror, 'notify', side_effect=mirror.MirrorError('delivery failed')):
+            with mock.patch.object(mirror, 'write_tar', side_effect=mirror.MirrorError('disk full')):
                 self.assertEqual(mirror.main(['--catalog', str(path), 'sync']), 1)
             self.assertEqual(low[version], pinned)
             self.assertEqual(json.loads((self.root / 'work/sent.json').read_text())['sent'], {})
@@ -748,9 +760,12 @@ class MirrorTest(unittest.TestCase):
             before = transport.call_count
             self.assertIsNone(mirror.sync(path))
             self.assertEqual(transport.call_count, before)
-            with mock.patch.object(mirror, 'notify', side_effect=mirror.MirrorError('delivery failed')), \
-                    self.assertRaisesRegex(mirror.MirrorError, 'delivery failed'):
+            # Written but never sent: the CI job's outbox is gone with it, and the ledger is still pending.
+            with mock.patch.object(mirror, 'write_bundle', side_effect=self.write_only):
                 mirror.sync(path, full=True)
+            with self.assertRaisesRegex(mirror.MirrorError, 'not sent yet'):
+                mirror.sync(path)
+            shutil.rmtree(self.root / 'out')
             recovery = mirror.sync(path)
             with tarfile.open(recovery) as archive:
                 metadata = json.load(archive.extractfile('images.json'))
@@ -828,10 +843,10 @@ class LedgerTest(unittest.TestCase):
                 {'sequence': sequence, 'created': created, 'images': [entry(digest)]}).encode()
         files[('registry-mirror-ledger', 'head', 'state.json')] = json.dumps(
             {'stream': 'a'*32, 'sequence': 2, 'sent': {}, 'registry': 'low.example.internal'}).encode()
-        with mock.patch.object(mirror, 'send') as send:
+        with mock.patch.object(mirror, 'write_bundle') as send:
             mirror.resend(since='2026-08-01')
-        self.assertEqual([i['transfer'] for i in send.call_args.args[4]], [new])
-        self.assertEqual(send.call_args.args[6:], ('resend', 1))
+        self.assertEqual([i['transfer'] for i in send.call_args.args[5]], [new])
+        self.assertEqual(send.call_args.args[7:], ('resend', 1))
 
     def test_import_accepts_a_resend_only_over_the_gap_it_covers(self):
         image, _ = fixture(self.stage)
@@ -967,46 +982,142 @@ class LedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(mirror.MirrorError, "IMPORT_DELETE_BUNDLES must be true or false, not 'yes'"):
             mirror.import_registry(f'{stem}.tar')
 
-    def test_a_delivered_bundle_leaves_nothing_on_the_runner(self):
-        self.store()
-        path, _, fake_copy, fake_digest = self.latest_entry()
-        os.environ['NIFI_URL'] = 'http://nifi.example.internal:9098/contentListener'
-        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch.object(mirror, 'notify') as sent:
-            bundle = mirror.sync(path)
-        self.assertEqual(sent.call_args.args[0], bundle)
-        self.assertEqual(list((self.root / 'out').iterdir()), [])
-
-    def test_without_a_destination_sync_mirrors_low_and_records_nothing_sent(self):
+    def test_send_delivers_each_file_once_and_clears_the_pending_ledger(self):
         files = self.store()
         path, _, fake_copy, fake_digest = self.latest_entry()
-        del os.environ['MIRROR_BUNDLE_DIR']
         with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
                 mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
                 mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch.object(mirror, 'notify') as sent, \
-                mock.patch('builtins.print') as said:
-            self.assertIsNone(mirror.sync(path))
-        sent.assert_not_called()
-        self.assertIn('not sent to the high side', said.call_args.args[0])
-        state = json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])
-        self.assertEqual((state['sequence'], state['sent']), (0, {}))
-        # Once NiFi is configured, the next sync sends what the first one could not.
-        os.environ['NIFI_URL'] = 'http://nifi.example.internal:9098/contentListener'
-        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
-                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
-                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
-                mock.patch.object(mirror, 'notify') as sent:
-            self.assertIsNotNone(mirror.sync(path))
-        sent.assert_called_once()
+                mock.patch.object(mirror, 'write_bundle', side_effect=self.write_only):
+            bundle = mirror.sync(path)
+        self.assertTrue(json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])['pending'])
+        posted = []
+        with mock.patch.object(mirror, 'post_file', side_effect=[mirror.MirrorError('NiFi down'), None, None]) as post:
+            with self.assertRaisesRegex(mirror.MirrorError, 'NiFi down'):
+                mirror.send('nifi', target='http://nifi.example.internal:9098/contentListener')
+            self.assertTrue(bundle.exists())  # still there to send again
+            with mock.patch('builtins.print'):
+                self.assertEqual(mirror.send('nifi', target='http://nifi.example.internal:9098/contentListener'), 1)
+            posted = [c.args[0].name for c in post.call_args_list]
+        self.assertEqual(posted, [bundle.name, bundle.name])
+        self.assertEqual(list((self.root / 'out').iterdir()), [])
+        self.assertFalse(json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])['pending'])
+        with mock.patch('builtins.print') as said:
+            self.assertEqual(mirror.send('nifi', target='http://x'), 0)
+        said.assert_called_once_with(f"nothing to send in {self.root / 'out'}")
 
-    def test_resend_refuses_without_a_destination(self):
+    def test_a_lost_bundle_keeps_the_ledger_pending_past_an_unrelated_resend(self):
+        files = self.store()
+        path, _, fake_copy, fake_digest = self.latest_entry()
+        head = lambda: json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])  # noqa: E731
+        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
+                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
+                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
+                mock.patch.object(mirror, 'write_bundle', side_effect=self.write_only), \
+                mock.patch.object(mirror, 'post_file'), mock.patch('builtins.print'):
+            mirror.sync(path)
+            mirror.send('nifi', target='http://nifi')
+            self.assertEqual((head()['pending'], head()['unsent']), (False, []))
+            lost = mirror.sync(path, full=True)  # written, then the CI job's outbox is lost
+            shutil.rmtree(self.root / 'out')
+            mirror.resend(image='mirror/alpine')  # no bridge: it does not stand in for the lost one
+            mirror.send('nifi', target='http://nifi')
+            self.assertEqual((head()['pending'], head()['unsent']), (True, [lost.name]))
+            recovery = mirror.sync(path)  # full, so it bridges the lost bundle
+            self.assertTrue(self.manifest(recovery)['full'])
+            mirror.send('nifi', target='http://nifi')
+            self.assertEqual((head()['pending'], head()['unsent']), (False, []))
+
+    def test_send_resumes_after_the_last_delivered_part_and_refuses_a_missing_one(self):
+        name = outbox_with(self.root / 'out', b'0123456789', 4)
+        posted, failures = [], [mirror.MirrorError('connection reset')]
+
+        def post(path, *_args):
+            if len(posted) == 1 and failures:
+                raise failures.pop()
+            posted.append(path.name)
+        with mock.patch.object(mirror, 'post_file', side_effect=post), mock.patch('builtins.print'):
+            with self.assertRaisesRegex(mirror.MirrorError, 'connection reset'):
+                mirror.send('nifi', target='http://nifi')
+            self.assertEqual(json.loads((self.root / 'out' / f'{name}.send.json').read_text())['delivered'],
+                             [f'{name}.part-001'])
+            (self.root / 'out' / f'{name}.part-003').unlink()
+            with self.assertRaisesRegex(mirror.MirrorError, 'part-003 is missing'):
+                mirror.send('nifi', target='http://nifi')
+        self.assertEqual(posted, [f'{name}.part-001', f'{name}.part-002'])
+
+    def test_unsent_tracking_through_bridges_crashes_and_old_ledgers(self):
+        name = lambda n: f"mirror-{'a' * 32}-{n:012d}.tar"  # noqa: E731
+        state = {'sequence': 5, 'unsent': [name(3), name(5)]}
+        state['sequence'] = 8
+        mirror.track_unsent(state, name(8), False, 4)  # a resend from 4 on covers 5, not 3
+        self.assertEqual(state['unsent'], [name(3), name(8)])
+        mirror.track_unsent(state, name(9), True, None)
+        self.assertEqual(state['unsent'], [name(9)])
+        old = {'sequence': 4, 'pending': True, 'unsent': ['an unsent bundle recorded by an older release']}
+        mirror.track_unsent(old, name(5), False, 2)
+        self.assertEqual(len(old['unsent']), 2)  # only a full bundle clears the old marker
+
+    def test_a_sequence_reserved_and_never_written_waits_for_a_full_bundle(self):
         self.store()
-        del os.environ['MIRROR_BUNDLE_DIR']
-        with self.assertRaisesRegex(mirror.MirrorError, 'set NIFI_URL'):
-            mirror.resend(sequences='1..')
+        (self.root / 'work').mkdir()
+        state = {'stream': 'a' * 32, 'sequence': 6, 'written': 5, 'unsent': [], 'pending': True, 'sent': {},
+                 'registry': 'low.example.internal'}
+        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'verify_image'), \
+                mock.patch('builtins.print'):
+            self.write_only(self.root / 'work', mirror.outbox(self.root / 'work'), self.root / 'work/sent.json',
+                            state, 'low', [], False, 'resend', None)
+        self.assertEqual(state['unsent'][0], 'sequence 6, reserved and never written')
+        self.assertEqual(len(state['unsent']), 2)
+
+    def test_a_reservation_without_a_bundle_keeps_the_ledger_pending(self):
+        files = self.store()
+        files[('registry-mirror-ledger', 'head', 'state.json')] = json.dumps(
+            {'stream': 'a' * 32, 'sequence': 6, 'written': 5, 'unsent': [], 'pending': True, 'sent': {},
+             'registry': 'low.example.internal'}).encode()
+        outbox_with(self.root / 'out', b'x', 1024, name=f"mirror-{'a' * 32}-000000000005.tar")
+        with mock.patch.object(mirror, 'post_file'), mock.patch('builtins.print'):
+            mirror.send('nifi', target='http://nifi')
+        self.assertTrue(json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])['pending'])
+
+    def test_low_only_mirrors_low_and_records_nothing_sent(self):
+        files = self.store()
+        path, _, fake_copy, fake_digest = self.latest_entry()
+        with mock.patch.object(mirror, 'run', return_value=b'{"schemaVersion": 2}'), \
+                mock.patch.object(mirror, 'copy', side_effect=fake_copy), \
+                mock.patch.object(mirror, 'raw_digest', side_effect=fake_digest), \
+                mock.patch('builtins.print') as said:
+            self.assertIsNone(mirror.sync(path, low_only=True))
+            self.assertIn('not bundled (--low-only)', said.call_args.args[0])
+            state = json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])
+            self.assertEqual((state['sequence'], state['sent']), (0, {}))
+            self.assertIsNotNone(mirror.sync(path))  # the next sync bundles what that one did not
+
+    def test_send_refuses_what_it_cannot_do(self):
+        with self.assertRaisesRegex(mirror.MirrorError, 'needs --url or NIFI_URL'):
+            mirror.send('nifi')
+        with self.assertRaisesRegex(mirror.MirrorError, '--format tar is for send dir'):
+            mirror.send('s3', form='tar')
+        out = self.root / 'out'
+        out.mkdir()
+        name = 'mirror-' + 'a' * 32 + '-000000000001.tar'
+        (out / f'{name}.part-001').write_bytes(b'x')
+        (out / f'{name}.sha256').write_text('x')
+        (out / f'{name}.send.json').write_text('{"kind": "delta", "sha256": "x", "parts": 1}')
+        with self.assertRaisesRegex(mirror.MirrorError, 'hand-carry needs whole bundles'):
+            mirror.send('dir', target=str(self.root / 'usb'), form='tar')
+
+    def test_hand_carry_copies_the_bundle_then_its_checksum(self):
+        out, usb = self.root / 'out', self.root / 'usb'
+        out.mkdir()
+        name = 'mirror-' + 'b' * 32 + '-000000000001.tar'
+        (out / name).write_bytes(b'tar')
+        (out / f'{name}.sha256').write_text(f'{hashlib.sha256(b"tar").hexdigest()}  {name}\n')
+        (out / f'{name}.send.json').write_text('{"kind": "delta", "sha256": "x", "parts": 0}')
+        with mock.patch('builtins.print'):
+            mirror.send('dir', target=str(usb), form='tar')
+        self.assertEqual(sorted(p.name for p in usb.iterdir()), [name, f'{name}.sha256'])
+        self.assertEqual(list(out.iterdir()), [])
 
     def test_old_variable_names_fail_with_their_new_names(self):
         os.environ.update({'LOW_QUAY_HOST': 'low.example.internal', 'EXPORT_SEQUENCE': '3..'})
@@ -1045,13 +1156,13 @@ class LedgerTest(unittest.TestCase):
             mirror.login()  # a high registry without authentication
         ran.assert_not_called()
 
-    def test_notify_streams_only_the_bundle_with_its_checksum_header(self):
+    def test_post_file_streams_only_the_bundle_with_its_checksum_header(self):
         bundle = self.root / 'mirror-x.tar'
         bundle.write_bytes(b'tar')
-        os.environ['NIFI_URL'] = 'http://user:secret@nifi.example.internal:9099/contentListener'
+        url = 'http://user:secret@nifi.example.internal:9099/contentListener'
         with mock.patch.object(mirror, 'run', return_value=b'200') as call, \
                 mock.patch('builtins.print') as said:
-            mirror.notify(bundle, 'resend')
+            mirror.post_file(bundle, mirror.attributes_of(bundle, 'resend'), url)
         (args,) = [c.args for c in call.call_args_list]  # one POST: no .sha256 crosses the diode
         self.assertIn('--http1.1', args)
         self.assertEqual(args[args.index('--upload-file') + 1], str(bundle))  # streamed, not read into memory
@@ -1138,51 +1249,75 @@ def unpack_flowfile(data):
     return attributes, content
 
 
-class DropTest(unittest.TestCase):
-    """MIRROR_DROP: bundles left as FlowFile packages in a directory or bucket for the low NiFi."""
+def outbox_with(out, data, cap, kind='delta', name='mirror-' + 'c' * 32 + '-000000000001.tar'):
+    """An outbox holding one bundle as write_bundle leaves it: whole, or parts of at most cap bytes."""
+    out.mkdir(exist_ok=True)
+    sink = mirror.PartSink(out, name, cap)
+    sink.write(data)
+    sink.flush_part()
+    parts = sink.number if sink.number > 1 else 0
+    if not parts:
+        os.replace(out / f'{name}.part-001', out / name)
+    checksum = hashlib.sha256(data).hexdigest()
+    (out / f'{name}.sha256').write_text(f'{checksum}  {name}' + (f'  {parts}' if parts else '') + '\n')
+    (out / f'{name}.send.json').write_text(json.dumps({'kind': kind, 'sha256': checksum, 'parts': parts}))
+    return name
+
+
+class SendTest(unittest.TestCase):
+    """mirror.py send: NiFi ListenHTTP, a directory or an S3 bucket the low NiFi collects from."""
 
     setUp = MirrorTest.setUp
 
-    def test_parts_land_in_the_drop_directory_as_flowfiles_with_their_attributes(self):
-        bundle = self.root / 'mirror-x.tar'
-        bundle.write_bytes(b'0123456789')
+    def test_parts_land_in_the_directory_as_flowfiles_with_their_attributes(self):
+        name = outbox_with(self.root / 'out', b'0123456789', 4)
         drop = self.root / 'transfer'
-        os.environ.update({'MIRROR_DROP': str(drop), 'MIRROR_BUNDLE_MAX_SIZE': '4'})
         with mock.patch('builtins.print'):
-            mirror.notify(bundle, 'delta')
+            mirror.send('dir', target=str(drop))
         self.assertEqual(sorted(p.name for p in drop.iterdir()),
-                         [f'mirror-x.tar.part-00{n}.ffv3' for n in (1, 2, 3)])  # no .partial left
-        attributes, content = unpack_flowfile((drop / 'mirror-x.tar.part-002.ffv3').read_bytes())
+                         [f'{name}.part-00{n}.ffv3' for n in (1, 2, 3)])  # no .partial left
+        attributes, content = unpack_flowfile((drop / f'{name}.part-002.ffv3').read_bytes())
         self.assertEqual(content, b'4567')
         self.assertEqual(attributes, {
-            'filename': 'mirror-x.tar.part-002', 'X-Sha256': hashlib.sha256(b'4567').hexdigest(),
+            'filename': f'{name}.part-002', 'X-Sha256': hashlib.sha256(b'4567').hexdigest(),
             'X-Artifact-Type': 'container-images', 'X-Artifact-Format': 'tar', 'X-Artifact-Action': 'mirror',
-            'X-Bundle-Kind': 'delta', 'X-Bundle-Name': 'mirror-x.tar', 'X-Bundle-Sha256': mirror.sha256(bundle),
+            'X-Bundle-Kind': 'delta', 'X-Bundle-Name': name, 'X-Bundle-Sha256': hashlib.sha256(b'0123456789').hexdigest(),
             'X-Bundle-Parts': '3'})
+        self.assertEqual(list((self.root / 'out').iterdir()), [])
 
     def test_a_long_value_uses_the_wide_length_field(self):
         attributes, content = unpack_flowfile(mirror.flowfile_v3({'a': 'v' * 70000}, 2) + b'ok')
         self.assertEqual((len(attributes['a']), content), (70000, b'ok'))
 
-    def test_the_s3_drop_streams_the_package_with_its_length(self):
-        bundle = self.root / 'mirror-y.tar'
-        bundle.write_bytes(b'bundle')
-        os.environ.update({'MIRROR_DROP': 's3', 'S3_BUCKET': 'transfer'})
+    def test_the_s3_drop_streams_the_package_with_its_length_and_metadata(self):
+        name = outbox_with(self.root / 'out', b'bundle', 1024, kind='full')
+        os.environ.update({'S3_BUCKET': 'transfer'})
         sent = {}
 
-        def put(method, key, data, length):
-            sent.update(method=method, key=key, body=data.read(), length=length)
+        def put(method, key, data, length, meta):
+            sent.update(method=method, key=key, body=data.read(), length=length, meta=meta)
             return io.BytesIO()
         with mock.patch.object(mirror, 's3_request', side_effect=put), mock.patch('builtins.print'):
-            mirror.notify(bundle, 'full')
-        self.assertEqual((sent['method'], sent['key'], sent['length']), ('PUT', 'mirror-y.tar.ffv3', len(sent['body'])))
+            mirror.send('s3')
+        self.assertEqual((sent['method'], sent['key'], sent['length']), ('PUT', f'{name}.ffv3', len(sent['body'])))
         attributes, content = unpack_flowfile(sent['body'])
-        self.assertEqual((attributes['filename'], attributes['X-Bundle-Kind'], content), ('mirror-y.tar', 'full', b'bundle'))
+        self.assertEqual((attributes['filename'], attributes['X-Bundle-Kind'], content), (name, 'full', b'bundle'))
+        self.assertEqual(sent['meta']['X-Sha256'], hashlib.sha256(b'bundle').hexdigest())
 
-    def test_nifi_url_and_mirror_drop_together_are_refused(self):
-        os.environ.update({'NIFI_URL': 'http://nifi.example.internal:9098/contentListener', 'MIRROR_DROP': 's3'})
-        with self.assertRaisesRegex(mirror.MirrorError, 'not both'):
-            mirror.bundle_destination()
+    def test_metadata_headers_are_signed(self):
+        os.environ.update({'S3_ENDPOINT': 'http://s3.example.internal', 'S3_BUCKET': 'b',
+                           'AWS_ACCESS_KEY_ID': 'k', 'AWS_SECRET_ACCESS_KEY': 's'})
+        with mock.patch.object(mirror.urllib.request, 'urlopen') as opened:
+            mirror.s3_request('PUT', 'x', b'', 0, {'X-Sha256': 'abc'})
+        request = opened.call_args.args[0]
+        self.assertEqual(request.get_header('X-amz-meta-x-sha256'), 'abc')
+        self.assertIn('x-amz-meta-x-sha256', request.get_header('Authorization'))
+
+    def test_mirror_drop_names_the_send_command(self):
+        os.environ['MIRROR_DROP'] = 's3'
+        with mock.patch('sys.stderr') as err:
+            self.assertEqual(mirror.main(['targets']), 1)
+        self.assertIn('MIRROR_DROP is now mirror.py send', ''.join(c.args[0] for c in err.write.call_args_list))
 
 
 class LargeAndBulkTest(unittest.TestCase):
@@ -1214,9 +1349,9 @@ class LargeAndBulkTest(unittest.TestCase):
 
     def test_only_the_first_bundle_of_a_split_run_is_full_or_bridges_a_gap(self):
         with mock.patch.object(mirror, 'batches', return_value=[['a'], ['b'], ['c']]), \
-                mock.patch.object(mirror, 'send', return_value='bundle') as sent:
-            mirror.send_batches('work', 'state', {}, 'low', ['a', 'b', 'c'], True, 'resend', bridges=7)
-        self.assertEqual([c.args[4:] for c in sent.call_args_list],
+                mock.patch.object(mirror, 'write_bundle', return_value='bundle') as sent:
+            mirror.send_batches('work', 'out', 'state', {}, 'low', ['a', 'b', 'c'], True, 'resend', bridges=7)
+        self.assertEqual([c.args[5:] for c in sent.call_args_list],
                          [(['a'], True, 'resend', 7), (['b'], False, 'resend', None), (['c'], False, 'resend', None)])
 
     def test_image_bytes_counts_every_manifest_config_and_layer_once(self):
@@ -1296,9 +1431,7 @@ class LargeAndBulkTest(unittest.TestCase):
                                                      f"docker://prod.example.internal/company-prod/alpine:{image['tag']}"))
 
     def test_a_bundle_over_the_cap_is_posted_as_parts_with_the_whole_checksum(self):
-        bundle = self.root / 'mirror-x.tar'
-        bundle.write_bytes(b'0123456789')
-        os.environ.update({'NIFI_URL': 'http://nifi.example.internal:9099/contentListener', 'MIRROR_BUNDLE_MAX_SIZE': '4'})
+        name = outbox_with(self.root / 'out', b'0123456789', 4)
         seen = []
 
         def post(*args):
@@ -1307,15 +1440,15 @@ class LargeAndBulkTest(unittest.TestCase):
             return b'200'
 
         with mock.patch.object(mirror, 'run', side_effect=post), mock.patch('builtins.print'):
-            mirror.notify(bundle, 'delta')
-        self.assertEqual([(name, data) for name, data, _ in seen],
-                         [('mirror-x.tar.part-001', b'0123'), ('mirror-x.tar.part-002', b'4567'), ('mirror-x.tar.part-003', b'89')])
-        for name, data, headers in seen:
+            mirror.send('nifi', target='http://nifi.example.internal:9099/contentListener')
+        self.assertEqual([(n, data) for n, data, _ in seen],
+                         [(f'{name}.part-001', b'0123'), (f'{name}.part-002', b'4567'), (f'{name}.part-003', b'89')])
+        for _, data, headers in seen:
             self.assertIn(f'X-Sha256: {hashlib.sha256(data).hexdigest()}', headers)
-            self.assertIn(f'X-Bundle-Sha256: {mirror.sha256(bundle)}', headers)
-            self.assertIn('X-Bundle-Name: mirror-x.tar', headers)
+            self.assertIn(f'X-Bundle-Sha256: {hashlib.sha256(b"0123456789").hexdigest()}', headers)
+            self.assertIn(f'X-Bundle-Name: {name}', headers)
             self.assertIn('X-Bundle-Parts: 3', headers)
-        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.name.startswith('mirror-x')), ['mirror-x.tar'])
+        self.assertEqual(list((self.root / 'out').iterdir()), [])
 
     def test_import_joins_the_parts_waits_for_a_missing_one_and_deletes_them_all(self):
         files = self.store()
@@ -1345,26 +1478,21 @@ class LargeAndBulkTest(unittest.TestCase):
         self.assertEqual(deleted.call_args.args[2],
                          [f'{stem}.tar.part-{n:03d}' for n in range(1, len(chunks) + 1)] + [f'{stem}.tar.sha256'])
 
-    def test_streamed_parts_join_to_the_same_tar_and_leave_nothing_on_disk(self):
+    def test_parts_join_to_the_same_tar(self):
         fixture(self.stage)
         (self.stage / 'images.json').write_text('{}')
         whole = io.BytesIO()
         mirror.write_tar(self.stage, whole)
-        measured = mirror.TarSink()
-        mirror.write_tar(self.stage, measured)
-        os.environ['MIRROR_BUNDLE_MAX_SIZE'] = '4KiB'
-        out = self.root / 'out'
+        out = self.root / 'parts'
         out.mkdir()
-        sent = []
-        with mock.patch.object(mirror, 'post_file', side_effect=lambda path, kind, extra: sent.append((path.name, path.read_bytes(), extra))), \
-                mock.patch('builtins.print'):
-            mirror.post_parts(self.stage, out / 'mirror-s.tar', measured, 'delta')
-        self.assertEqual(b''.join(data for _, data, _ in sent), whole.getvalue())
-        self.assertEqual([name for name, _, _ in sent], [f'mirror-s.tar.part-{n:03d}' for n in range(1, len(sent) + 1)])
-        self.assertTrue(all(len(data) <= 4096 for _, data, _ in sent))
-        self.assertIn(f'X-Bundle-Sha256: {hashlib.sha256(whole.getvalue()).hexdigest()}', sent[0][2])
-        self.assertIn(f'X-Bundle-Parts: {len(sent)}', sent[-1][2])
-        self.assertEqual(list(out.iterdir()), [])
+        sink = mirror.PartSink(out, 'mirror-s.tar', 4096)
+        mirror.write_tar(self.stage, sink)
+        sink.flush_part()
+        parts = sorted(out.iterdir())
+        self.assertEqual([p.name for p in parts], [f'mirror-s.tar.part-{n:03d}' for n in range(1, len(parts) + 1)])
+        self.assertEqual(b''.join(p.read_bytes() for p in parts), whole.getvalue())
+        self.assertTrue(all(p.stat().st_size <= 4096 for p in parts))
+        self.assertEqual(sink.digest.hexdigest(), hashlib.sha256(whole.getvalue()).hexdigest())
 
     def test_a_corrupted_part_is_refused_before_anything_is_pushed(self):
         files = self.store()

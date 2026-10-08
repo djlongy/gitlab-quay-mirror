@@ -64,16 +64,19 @@ new store first, then switch `IMPORT_STORE` and the NiFi upload processor.
    - decides whether it needs sending: its digest, platform or version tags differ from
      what `sent` records. A full sync sends everything.
 3. If nothing needs sending, prints `nothing to send` and stops. No bundle, no new sequence.
-   If something does but neither `NIFI_URL` nor `MIRROR_BUNDLE_DIR` is set, it prints
-   `not sent to the high side` and stops the same way. The ledger records only bundles that
-   left, so the next run with a destination sends them.
+   With `--low-only` it prints `not bundled (--low-only)` and stops the same way. The ledger
+   records only bundles that were written, so the next sync without it sends them.
 4. Otherwise reserves the next sequence. It writes `pending: true` to the ledger first, so a
    crash cannot reuse the number.
 5. Copies each changed image out of the low registry into the bundle, checks every file against its
    digest, and writes `images.json` and the `.sha256`.
 6. Uploads `<sequence>/images.json` to the ledger with its creation time.
-7. POSTs the checksum, then the bundle, to `NIFI_URL`, and deletes both once NiFi accepts them.
-8. Updates `sent`, `aliases` and `pending: false` in the ledger.
+7. Writes the bundle (or its parts), the `.sha256` and last a `.send.json` into the outbox, and
+   updates `sent` and `aliases` in the ledger. `pending` stays true.
+   The bundle joins `unsent` in the ledger (a full bundle, or a bridging resend, replaces the list).
+8. `mirror.py send` delivers each file, records it in the `.send.json`, deletes it, and takes the
+   bundle off `unsent`. `pending` is true while `unsent` is not empty, so if the outbox is lost
+   the next sync is full.
 
 The bundle is named `mirror-<stream>-<sequence>.tar`, for example
 `mirror-1039946406c84e0ea1b2da9b9f231775-000000000004.tar`.
@@ -139,7 +142,7 @@ action, `Run pipeline with RESEND_SEQUENCE=N..`.
 |---|---|---|
 | A bundle never reached the high side | the next import fails: `missing earlier bundle N to M (imported up to N-1, received M+1); on the low side, Run pipeline with RESEND_SEQUENCE=N..` | exactly that |
 | A run died after reserving a sequence | `pending: true` in the ledger | nothing: the next sync is full and bridges it |
-| NiFi refused the POST | sync fails; the ledger records the bundle | rerun the pipeline (the next sync is full), or `RESEND_SEQUENCE=N` |
+| send failed (NiFi refused the POST, the share or bucket was unreachable) | send fails; the ledger records the bundle and stays pending | run send again while the outbox is there; otherwise rerun the pipeline (the next sync is full), or `RESEND_SEQUENCE=N` |
 | The high side lost its receipt | `--registry` replays the stream from bundle 1 out of `registry-mirror-bundles` (pushes are idempotent, later bundles win); with deleted or expired bundles, and with `--inbox`, it refuses all but a full bundle | with every bundle kept, nothing; otherwise Run pipeline on the low side with `RESEND_ALL=true` |
 | The ledger is deleted | sync starts a new stream | import its first bundle with `--adopt-stream` after review |
 | The source deleted an old digest | a resend of that image fails | update the catalog; the low registry still holds every image it ever received |
