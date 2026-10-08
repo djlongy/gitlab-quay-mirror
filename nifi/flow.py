@@ -12,10 +12,10 @@ high: ListFile #{mirror.diode} -> FetchFile        (the diode's egress directory
         -> RouteOnAttribute container-images     (X-Artifact-Type and X-Artifact-Action)
         -> CryptographicHashContent -> RouteOnAttribute verified   (content matches X-Sha256)
         -> InvokeHTTP PUT  generic package registry-mirror-bundles/<bundle>/<file>   (PRIVATE-TOKEN)
-        -> InvokeHTTP POST pipeline?ref=#{gitlab.ref} with BUNDLE=<file> (mirror.py import --registry)
+        -> InvokeHTTP POST pipeline?ref=#{gitlab.container.branch} with BUNDLE=<file> (mirror.py import --registry)
 
 Anything not matching ends in "Rejected (inspect queue)", left stopped so it waits there.
-gitlab.token is a sensitive parameter: a project access token, role Developer, scope api.
+gitlab.container.token is a sensitive parameter: a project access token, role Developer, scope api.
 """
 import argparse
 import json
@@ -27,12 +27,12 @@ import urllib.parse
 import urllib.request
 
 DEFAULTS = {"low": {"mirror.port": "9098", "mirror.diode": "/diode/mirror"},
-            "high": {"mirror.diode": "/diode/mirror", "gitlab.api": "https://gitlab.example.com/api/v4",
-                     "gitlab.project": "", "gitlab.ref": "main", "gitlab.token": ""}}
+            "high": {"mirror.diode": "/diode/mirror", "gitlab.api.url": "https://gitlab.example.com/api/v4",
+                     "gitlab.container.projectId": "", "gitlab.container.branch": "main", "gitlab.container.token": ""}}
 # --store s3: the high side files bundles in an S3-compatible bucket instead of the generic package registry.
 S3_DEFAULTS = {"s3.endpoint": "", "s3.bucket": "", "s3.region": "us-east-1", "s3.prefix": "",
                "s3.access_key": "", "s3.secret_key": "", "s3.ca": ""}
-SENSITIVE = {"gitlab.token", "s3.access_key", "s3.secret_key"}
+SENSITIVE = {"gitlab.container.token", "s3.access_key", "s3.secret_key"}
 
 
 class Nifi:
@@ -158,7 +158,7 @@ def build_low(n, pg):
 
 
 def build_high(n, pg, store="gitlab"):
-    gitlab = "#{gitlab.api}/projects/#{gitlab.project}"
+    gitlab = "#{gitlab.api.url}/projects/#{gitlab.container.projectId}"
     listing = n.processor(pg, "ListFile", "List the diode", 0,
                           {"Input Directory": "#{mirror.diode}", "File Filter": r".*\.ffv3",
                            "Recurse Subdirectories": "false", "Minimum File Age": "5 sec"}, schedule="10 sec")
@@ -190,14 +190,14 @@ def build_high(n, pg, store="gitlab"):
         upload = n.processor(pg, "InvokeHTTP", "Upload to GitLab", 6, {
             "HTTP Method": "PUT", "Request Body Enabled": "true",
             "HTTP URL": gitlab + "/packages/generic/registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
-            "PRIVATE-TOKEN": "#{gitlab.token}", "Response Body Attribute Name": "gitlab.response"},
+            "PRIVATE-TOKEN": "#{gitlab.container.token}", "Response Body Attribute Name": "gitlab.response"},
             terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
     start = n.processor(pg, "InvokeHTTP", "Start the import pipeline", 7, {
         "HTTP Method": "POST", "Request Body Enabled": "false",
         # variables[][key]=BUNDLE&variables[][value]=<file>, brackets encoded
-        "HTTP URL": gitlab + "/pipeline?ref=#{gitlab.ref}&variables%5B%5D%5Bkey%5D=BUNDLE"
+        "HTTP URL": gitlab + "/pipeline?ref=#{gitlab.container.branch}&variables%5B%5D%5Bkey%5D=BUNDLE"
                              "&variables%5B%5D%5Bvalue%5D=${filename:urlEncode()}",
-        "PRIVATE-TOKEN": "#{gitlab.token}", "Response Body Attribute Name": "gitlab.response"},
+        "PRIVATE-TOKEN": "#{gitlab.container.token}", "Response Body Attribute Name": "gitlab.response"},
         terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
     done = n.processor(pg, "UpdateAttribute", "Delivered", 8, {})
     rejected = n.processor(pg, "UpdateAttribute", "Rejected (inspect queue)", 9, {})
@@ -232,7 +232,7 @@ def main():
     ap.add_argument("--user", default=os.environ.get("NIFI_USER", "admin"))
     ap.add_argument("--password", default=os.environ.get("NIFI_PASSWORD"))
     ap.add_argument("--param", action="append", default=[], help="name=value; see DEFAULTS. "
-                    "gitlab.token is read from GITLAB_TOKEN when not given")
+                    "gitlab.container.token is read from GITLAB_TOKEN when not given")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (self-signed NiFi)")
     ap.add_argument("--export", help="also write the group's flow definition to this file")
     ap.add_argument("--store", choices=("gitlab", "s3"), default="gitlab",
@@ -243,9 +243,9 @@ def main():
     defaults = dict(DEFAULTS[args.side], **(S3_DEFAULTS if args.store == "s3" else {}))
     params = dict(defaults, **dict(p.split("=", 1) for p in args.param))
     if args.side == "high":
-        params["gitlab.token"] = params["gitlab.token"] or os.environ.get("GITLAB_TOKEN", "")
-        if not params["gitlab.project"] or not params["gitlab.token"]:
-            raise SystemExit("high side needs --param gitlab.project=<id> and GITLAB_TOKEN")
+        params["gitlab.container.token"] = params["gitlab.container.token"] or os.environ.get("GITLAB_TOKEN", "")
+        if not params["gitlab.container.projectId"] or not params["gitlab.container.token"]:
+            raise SystemExit("high side needs --param gitlab.container.projectId=<id> and GITLAB_TOKEN")
         if args.store == "s3":
             params["s3.access_key"] = params["s3.access_key"] or os.environ.get("AWS_ACCESS_KEY_ID", "")
             params["s3.secret_key"] = params["s3.secret_key"] or os.environ.get("AWS_SECRET_ACCESS_KEY", "")

@@ -68,14 +68,14 @@ package version.
 1. Top-right menu (**☰**) > **Parameter Contexts** > **+**.
 2. **Settings** tab: Name `registry-mirror-high`.
 3. **Parameters** tab, add four parameters with **+**. Choose **Sensitive: Yes** for
-   `gitlab.token` when you create it: it cannot be changed afterwards.
+   `gitlab.container.token` when you create it: it cannot be changed afterwards.
 
    | Name | Value | Sensitive |
    |---|---|---|
-   | `gitlab.api` | `https://<gitlab>/api/v4` | No |
-   | `gitlab.project` | the numeric project ID | No |
-   | `gitlab.ref` | the default branch, for example `main` | No |
-   | `gitlab.token` | the access token | **Yes** |
+   | `gitlab.api.url` | `https://<gitlab>/api/v4` | No |
+   | `gitlab.container.projectId` | the numeric project ID | No |
+   | `gitlab.container.branch` | the default branch, for example `main` | No |
+   | `gitlab.container.token` | the access token | **Yes** |
 
 4. **Apply**.
 
@@ -135,10 +135,10 @@ Type **InvokeHTTP**.
 | Property | Value |
 |---|---|
 | HTTP Method | `PUT` |
-| HTTP URL | `#{gitlab.api}/projects/#{gitlab.project}/packages/generic/registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}` |
+| HTTP URL | `#{gitlab.api.url}/projects/#{gitlab.container.projectId}/packages/generic/registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}` |
 | Request Body Enabled | `true` |
 | Response Body Attribute Name | `gitlab.response` |
-| `PRIVATE-TOKEN` *(add, sensitive)* | `#{gitlab.token}` |
+| `PRIVATE-TOKEN` *(add, sensitive)* | `#{gitlab.container.token}` |
 
 Auto-terminate: `Response`. For `PRIVATE-TOKEN`, tick **Sensitive** in the add dialog;
 a dynamic property on InvokeHTTP is sent as a request header.
@@ -189,10 +189,10 @@ Type **InvokeHTTP**.
 | Property | Value |
 |---|---|
 | HTTP Method | `POST` |
-| HTTP URL | `#{gitlab.api}/projects/#{gitlab.project}/pipeline?ref=#{gitlab.ref}&variables%5B%5D%5Bkey%5D=BUNDLE&variables%5B%5D%5Bvalue%5D=${filename:urlEncode()}` |
+| HTTP URL | `#{gitlab.api.url}/projects/#{gitlab.container.projectId}/pipeline?ref=#{gitlab.container.branch}&variables%5B%5D%5Bkey%5D=BUNDLE&variables%5B%5D%5Bvalue%5D=${filename:urlEncode()}` |
 | Request Body Enabled | `false` |
 | Response Body Attribute Name | `gitlab.response` |
-| `PRIVATE-TOKEN` *(add, sensitive)* | `#{gitlab.token}` |
+| `PRIVATE-TOKEN` *(add, sensitive)* | `#{gitlab.container.token}` |
 
 Auto-terminate: `Response`. Type the `%5B%5D` sequences as shown: they are `[]`,
 encoded.
@@ -249,8 +249,8 @@ arrow away and back onto the same processor.
 If anything reaches **Rejected (inspect queue)**, right-click the queue > **List queue**
 and open the flowfile's attributes:
 - `invokehttp.status.code` and `gitlab.response` explain a GitLab refusal: 401 means the
-  token, 404 the project ID or `gitlab.api`, 400 with "insufficient permission to run a
-  pipeline" means Developers may not merge to `gitlab.ref`.
+  token, 404 the project ID or `gitlab.api.url`, 400 with "insufficient permission to run a
+  pipeline" means Developers may not merge to `gitlab.container.branch`.
 - A file rejected at **File matches X-Sha256** arrives damaged. On the low side,
   run the pipeline with `RESEND_SEQUENCE=<n>..`.
 

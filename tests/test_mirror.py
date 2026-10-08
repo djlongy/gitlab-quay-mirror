@@ -878,7 +878,9 @@ class LedgerTest(unittest.TestCase):
             shutil.rmtree(self.root / 'import')  # the next job runs on a clean runner
             mirror.import_registry(f'mirror-{stream}-000000000001.tar')
         # Without the registry's receipt the second run would push both bundles again.
-        self.assertEqual(said.call_args_list[-1], mock.call(f'superseded: mirror-{stream}-000000000001.tar'))
+        self.assertEqual(said.call_args_list[-2:], [mock.call(f'superseded: mirror-{stream}-000000000001.tar'),
+                                                    mock.call(f'not checking the store for mirror-{stream}-000000000001: '
+                                                              'IMPORT_DELETE_BUNDLES is not true')])
         self.assertEqual(json.loads(files[('registry-mirror-receipt', 'head', 'received.json')])['sequence'], 2)
 
     def test_s3_store_signs_a_path_style_request_and_reads_a_missing_key_as_none(self):
@@ -916,11 +918,45 @@ class LedgerTest(unittest.TestCase):
             mirror.import_registry(f'{stem}.tar')
         os.environ['PACKAGE_TOKEN'] = 'maintainer-token'
         with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
-                mock.patch.object(mirror, 'store_delete') as deleted, mock.patch('builtins.print') as said:
+                mock.patch.object(mirror, 'store_delete', side_effect=[1, 0]) as deleted, \
+                mock.patch('builtins.print') as said:
             mirror.import_registry(f'{stem}.tar')
             mirror.import_registry(f'{stem}.tar.sha256')  # the second file's trigger, after the delete
-        deleted.assert_called_once_with('registry-mirror-bundles', stem, [f'{stem}.tar', f'{stem}.tar.sha256'])
-        self.assertEqual(said.call_args_list[-1], mock.call(f'already imported: {stem}.tar'))
+        self.assertEqual(deleted.call_count, 2)  # the import, then the late trigger's check for a leftover
+        deleted.assert_called_with('registry-mirror-bundles', stem, [f'{stem}.tar', f'{stem}.tar.sha256'])
+        printed = [c.args[0] for c in said.call_args_list]
+        self.assertIn(f'deleted from the store: {stem}', printed)
+        self.assertEqual(printed[-2:], [f'already imported: {stem}.tar', f'nothing to delete in the store: {stem}'])
+
+    def test_cleanup_says_why_a_bundle_stays_and_removes_a_leftover_once_enabled(self):
+        files = self.store()
+        image, _ = fixture(self.stage)
+        stream, stem = 'f' * 32, f"mirror-{'f' * 32}-000000000001"
+        pack(self.stage, self.root / f'{stem}.tar', sequence=1, image=image, stream=stream)
+        for name in (f'{stem}.tar', f'{stem}.tar.sha256'):
+            files[('registry-mirror-bundles', stem, name)] = (self.root / name).read_bytes()
+        os.environ['CI_ENVIRONMENT_NAME'] = 'dev'
+        with mock.patch.object(mirror, 'copy'), mock.patch.object(mirror, 'raw_digest', return_value=image['digest']), \
+                mock.patch.object(mirror, 'store_delete') as deleted, mock.patch('builtins.print') as said:
+            mirror.import_registry(f'{stem}.tar')  # IMPORT_DELETE_BUNDLES never reached the job
+        printed = [c.args[0] for c in said.call_args_list]
+        deleted.assert_not_called()
+        self.assertIn('setting: IMPORT_DELETE_BUNDLES is not set in this job (environment dev): '
+                      'imported bundles stay in the store', printed)
+        self.assertIn(f'kept in the store: {stem} (IMPORT_DELETE_BUNDLES is not true)', printed)
+        os.environ.update({'IMPORT_DELETE_BUNDLES': 'true', 'PACKAGE_TOKEN': 'maintainer-token'})
+        with mock.patch.object(mirror, 'store_delete', return_value=1) as deleted, mock.patch('builtins.print') as said:
+            mirror.import_registry(f'{stem}.tar')  # a re-trigger once the setting is fixed
+        deleted.assert_called_once()
+        self.assertIn(mock.call(f'deleted from the store: {stem}'), said.call_args_list)
+        self.assertIn(mock.call('setting: PACKAGE_TOKEN=(set)'), said.call_args_list)
+        os.environ['NIFI_URL'] = 'https://user:secret@nifi.example.internal:9443/contentListener'
+        with mock.patch('builtins.print') as said:
+            mirror.settings(('NIFI_URL', 'not posted', False))
+        said.assert_called_once_with('setting: NIFI_URL=https://nifi.example.internal:9443/contentListener')
+        os.environ['IMPORT_DELETE_BUNDLES'] = 'yes'
+        with self.assertRaisesRegex(mirror.MirrorError, "IMPORT_DELETE_BUNDLES must be true or false, not 'yes'"):
+            mirror.import_registry(f'{stem}.tar')
 
     def test_a_delivered_bundle_leaves_nothing_on_the_runner(self):
         self.store()
