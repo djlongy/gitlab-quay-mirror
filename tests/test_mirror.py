@@ -1320,6 +1320,101 @@ class SendTest(unittest.TestCase):
         self.assertIn('MIRROR_DROP is now mirror.py send', ''.join(c.args[0] for c in err.write.call_args_list))
 
 
+class BlobDeltaTest(unittest.TestCase):
+    """MIRROR_BLOB_DELTA: blobs the high side already holds, or this bundle carries once, are left out."""
+
+    setUp = MirrorTest.setUp
+
+    def two_images_one_layer(self):
+        first, layer = fixture(self.stage)
+        building = self.stage / 'second'
+        config = blob(building, {'architecture': 'arm64', 'os': 'linux'})
+        held = self.stage / 'images' / first['transfer'].replace(':', '-')
+        shutil.copy(held / layer['digest'][7:], building / layer['digest'][7:])
+        root = blob(building, {'schemaVersion': 2, 'config': config, 'layers': [layer]})
+        place(self.stage, building, root)
+        second = mirror.parse_image('docker.io/library/busybox:1@' + root['digest'], 'mirror/busybox')
+        return first, second | {'transfer': root['digest'], 'tags': ['1']}, layer
+
+    def metadata(self, images, **extra):
+        return {'schema': 1, 'stream': 'a' * 32, 'sequence': 2, 'full': False, 'images': images, **extra}
+
+    def test_a_layer_twice_in_one_bundle_travels_once(self):
+        first, second, layer = self.two_images_one_layer()
+        metadata = self.metadata([first, second])
+        with mock.patch('builtins.print'):
+            mirror.omit_known_blobs(self.stage, [first, second], {}, metadata)
+        name = second['transfer'].replace(':', '-')
+        self.assertEqual(metadata['omitted'], {name: {layer['digest']: ['bundle:' + first['transfer'].replace(':', '-')]}})
+        self.assertFalse((self.stage / 'images' / name / layer['digest'][7:]).exists())
+        mirror.validate_manifest(metadata)
+        mirror.restore_blobs(self.stage, metadata, 'high.example.internal', self.root)
+        for image in (first, second):
+            mirror.verify_image(self.stage / 'images' / image['transfer'].replace(':', '-'), image['transfer'])
+
+    def test_a_layer_an_earlier_bundle_carried_is_read_back_from_the_high_registry(self):
+        first, second, layer = self.two_images_one_layer()
+        earlier = self.root / 'on-high'
+        shutil.copytree(self.stage / 'images' / first['transfer'].replace(':', '-'), earlier)
+        shutil.rmtree(self.stage / 'images' / first['transfer'].replace(':', '-'))
+        state = {}
+        mirror.remember_blobs(state, [first], {first['transfer']: {layer['digest']}})
+        metadata = self.metadata([second])
+        with mock.patch('builtins.print'):
+            mirror.omit_known_blobs(self.stage, [second], state, metadata)
+        hint = 'mirror/alpine@' + first['transfer']
+        self.assertEqual(list(metadata['omitted'].values()), [{layer['digest']: [hint]}])
+        mirror.validate_manifest(metadata)
+        os.environ['IMPORT_PATH_REWRITE'] = 'mirror/=prod/'
+        fetched = []
+
+        def fake_copy(source, destination, *_args):
+            fetched.append(source)
+            shutil.copytree(earlier, Path(destination[4:]))
+        with mock.patch.object(mirror, 'copy', side_effect=fake_copy), mock.patch('builtins.print'):
+            mirror.restore_blobs(self.stage, metadata, 'high.example.internal', self.root)
+        self.assertEqual(fetched, ['docker://high.example.internal/prod/alpine@' + first['transfer']])
+        mirror.verify_image(self.stage / 'images' / second['transfer'].replace(':', '-'), second['transfer'])
+
+    def test_two_tags_on_one_digest_keep_their_shared_blobs(self):
+        first, _, layer = self.two_images_one_layer()
+        twin = first | {'tag': 'latest', 'tags': ['latest']}
+        metadata = self.metadata([first, twin])
+        with mock.patch('builtins.print'):
+            mirror.omit_known_blobs(self.stage, [first, twin], {}, metadata)
+        self.assertNotIn('omitted', metadata)
+        self.assertTrue((self.stage / 'images' / first['transfer'].replace(':', '-') / layer['digest'][7:]).exists())
+
+    def test_the_blob_memory_drops_the_oldest_first(self):
+        state = {'blobs': {f'sha256:{n:064x}': ['a/b@x'] for n in range(5)}}
+        with mock.patch.object(mirror, 'BLOB_MEMORY', 4):
+            mirror.remember_blobs(state, [{'target': 'a/c', 'transfer': 't'}], {'t': {f'sha256:{0:064x}'}})
+        self.assertEqual(list(state['blobs']), [f'sha256:{n:064x}' for n in (2, 3, 4, 0)])
+
+    def test_an_expired_hint_names_the_resend(self):
+        first, second, layer = self.two_images_one_layer()
+        metadata = self.metadata([second], schema=2, omitted={
+            second['transfer'].replace(':', '-'): {layer['digest']: ['mirror/alpine@' + first['transfer'],
+                                                                     'mirror/old@' + first['transfer']]}})
+        with mock.patch.object(mirror, 'copy', side_effect=mirror.MirrorError('manifest unknown')) as tried, \
+                self.assertRaisesRegex(mirror.MirrorError, 'RESEND_ALL=true'):
+            mirror.restore_blobs(self.stage, metadata, 'high.example.internal', self.root)
+        self.assertEqual(tried.call_count, 2)  # each named image is tried before giving up
+
+    def test_omitted_metadata_is_checked(self):
+        first, second, layer = self.two_images_one_layer()
+        good = {second['transfer'].replace(':', '-'): {layer['digest']: ['mirror/alpine@' + first['transfer']]}}
+        for bad in ({'sha256-' + 'f' * 64: good[next(iter(good))]},  # not an image in this bundle
+                    {next(iter(good)): {layer['digest']: ['../../etc@' + first['transfer']]}},
+                    {next(iter(good)): {layer['digest']: ['bundle:sha256-' + 'e' * 64]}},
+                    {next(iter(good)): {layer['digest']: []}},
+                    {next(iter(good)): {layer['digest']: 'mirror/alpine@' + first['transfer']}}):
+            with self.subTest(bad), self.assertRaisesRegex(mirror.MirrorError, 'omitted-blob'):
+                mirror.validate_manifest(self.metadata([second], schema=2, omitted=bad))
+        with self.assertRaises(mirror.MirrorError):
+            mirror.validate_manifest(self.metadata([second], omitted=good))  # schema 1 cannot omit
+
+
 class LargeAndBulkTest(unittest.TestCase):
     """Size-capped bundles, bulk lists, path rewrites and out-of-order arrival."""
 

@@ -27,6 +27,8 @@ variables:
   # share mounted on the runner, for a low NiFi ListFile) or s3 (.ffv3 objects in S3_BUCKET at S3_ENDPOINT,
   # S3_PREFIX optional, keys in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, for a low NiFi ListS3).
   MIRROR_SEND: 'nifi'
+  # true: delta bundles leave out layers the high side already has (README, Blob delta).
+  MIRROR_BLOB_DELTA: 'false'
   MIRROR_SEND_PATH: ''
 
 verify:

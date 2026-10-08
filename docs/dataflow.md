@@ -96,6 +96,12 @@ ledger, so a crash cannot reuse it. Each file is checked against its digest. For
 The bundle is named `mirror-<stream>-<sequence>.tar`. The stream is a random id fixed when the
 ledger is first created; the sequence counts up from 1.
 
+With `MIRROR_BLOB_DELTA=true`, a delta bundle leaves out each layer or config an earlier bundle
+carried (the ledger's `blobs` map names the newest image that holds it) and any second copy within
+the bundle. `images.json` becomes schema 2 with `omitted`: per image, each left-out blob and where
+import finds it (`<target>@<digest>` in the high registry, or `bundle:<dir>`). Full bundles and
+resends carry everything.
+
 ### 5. Send
 
 Sync writes the bundle into the outbox (`--out`): the tar, or `<bundle>.part-001`, `.part-002`
@@ -164,7 +170,9 @@ receipt holds the stream, the last sequence imported and that bundle's checksum.
 2. Checks the tar against its `.sha256` and every manifest, config and layer inside against
    its digest. A bundle in parts is read part by part straight into the unpacked folder, each
    part fetched when needed and deleted once read, and its checksum is compared at the end.
-   Nothing is pushed before every check passes.
+   A schema 2 bundle first gets its left-out blobs back: copied from another image in the
+   bundle, or read from the named image in the high registry (`blob delta: restored N blob(s)`),
+   and then checked like the rest. Nothing is pushed before every check passes.
 3. Accepts the next sequence, a full bundle, or a resend that covers a gap. It refuses an
    older sequence, so a replayed bundle cannot roll a moved tag such as `latest` back. A later
    sequence that arrives before an earlier one waits in the store: the job exits 3, which the

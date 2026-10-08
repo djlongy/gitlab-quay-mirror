@@ -28,6 +28,7 @@ Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` 
 | Optional | `MIRROR_SCAN`, `GRYPE_FAIL_ON` | `true`, `critical` | Syft SBOM and Grype gate before `sync`; `false` skips both |
 | Optional | `SYFT_IMAGE`, `GRYPE_IMAGE` | `docker.io/anchore/syft:v1.54.0-debug`, `docker.io/anchore/grype:v0.120.0-debug` | Scanner images |
 | Optional | `MIRROR_BUNDLE_DIR` | `outbox/` in `MIRROR_STATE_DIR` | Outbox when `--out` is not given (the pipeline passes `--out outbox`) |
+| Optional | `MIRROR_BLOB_DELTA` | `false` | `true` leaves out of each delta bundle the layers and configs the high side already has, and any second copy within the bundle. See [Blob delta](#blob-delta) |
 | Optional | `MIRROR_BUNDLE_MAX_SIZE` | `4GiB` | Largest file that leaves the low side: images are grouped into bundles up to this size, and a bundle over it (one larger image) goes in parts. Keep it under the high store's file limit (GitLab: 5 GiB by default) |
 | Run pipeline | `RESEND_ALL`, `RESEND_SEQUENCE`, `RESEND_SINCE`, `RESEND_IMAGE` | none | Recovery, see [Resend](#resend) |
 
@@ -93,6 +94,26 @@ Flags win over the environment; the environment only fills in what a flag leaves
 - One file per bundle: set `MIRROR_BUNDLE_MAX_SIZE` above the largest image (for example `100GiB`).
   Keep it under what the high store takes: a GitLab generic package is 5 GiB by default, S3 has no
   practical limit.
+
+### Blob delta
+
+By default a bundle carries every changed image whole. With `MIRROR_BLOB_DELTA=true` (or
+`sync --blob-delta`) the ledger remembers every layer and config each bundle carried, and the
+newest image that holds it. A later delta bundle then leaves out a blob the high side already has,
+and a second copy of one in the same bundle; `images.json` (schema 2) names, for each left-out
+blob, the image to read it from: one already in the high registry, or another image in the bundle.
+`import` reads those images back from the high `TARGET_REGISTRY` into the job, puts each blob in
+place, and checks every file against its digest as before.
+
+- An app rebuilt on the same base sends only its own layers. In the lab, a 46 MB image rebuilt on
+  the same python base crossed as a 2 MB bundle; two node images on one base crossed as one copy.
+- Full bundles (the first, `RESEND_ALL`, recovery) and resends always carry every blob, so they
+  are also how the high side recovers.
+- The high import account needs read access to the images it pushed. If the high registry has
+  expired or deleted one (tag expiry, retention, garbage collection), import fails and names it:
+  Run pipeline on the low side with `RESEND_ALL=true`.
+- `IMPORT_PATH_REWRITE` applies to those reads too. An importer from before this release refuses
+  a schema 2 bundle rather than pushing an incomplete image: upgrade the high side first.
 
 ## High side: receive, load, push
 

@@ -38,6 +38,7 @@ MANIFESTS = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.dock
 CHART_CONFIG = "application/vnd.cncf.helm.config.v1+json"
 CHART_LAYERS = ("application/vnd.cncf.helm.chart.content.v1.tar+gzip", "application/vnd.cncf.helm.chart.provenance.v1.prov")
 LEDGER, BUNDLES, RECEIPTS = "registry-mirror-ledger", "registry-mirror-bundles", "registry-mirror-receipt"
+BLOB_MEMORY = 20000  # layers and configs the ledger remembers for MIRROR_BLOB_DELTA
 OUTBOX_FILE = re.compile(r"mirror-[0-9a-f]{32}-[0-9]{12}\.tar(?:\.part-[0-9]{3}|\.sha256|\.send\.json)?(?:\.tmp)?")
 BUNDLE_NAME = re.compile(r"(mirror-[0-9a-f]{32}-[0-9]{12})\.tar(?:\.sha256|\.part-[0-9]{3})?")
 INDEXES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
@@ -845,6 +846,7 @@ def sync(path, full=False, out=None, low_only=False):
     in the ledger; mirror.py send delivers them. low_only: update the low registry and write nothing."""
     low = registry("TARGET_REGISTRY")
     settings(("MIRROR_BUNDLE_DIR", "bundles are written to the outbox in MIRROR_STATE_DIR", False),
+             ("MIRROR_BLOB_DELTA", "every bundle carries whole images", False),
              ("MIRROR_LEDGER", "what was sent is kept only in MIRROR_STATE_DIR, which a CI job does not keep", False),
              ("MIRROR_PLATFORM", "every platform of each image is sent", False),
              ("MIRROR_BUNDLE_MAX_SIZE", "bundles are split at 4GiB", False))
@@ -1026,6 +1028,56 @@ def track_unsent(state, name, full, bridges):
     state["written"] = state["sequence"]
 
 
+def image_blobs(directory):
+    """The config and layer digests a staged dir: copy holds or lists, from its manifests."""
+    found = set()
+    for path in [directory / "manifest.json", *directory.glob("*.manifest.json")]:
+        data = json.loads(path.read_bytes())
+        for blob in [data.get("config") or {}, *data.get("layers", [])]:
+            if blob.get("digest"):
+                found.add(blob["digest"])
+    return found
+
+
+def omit_known_blobs(stage, changed, state, metadata):
+    """MIRROR_BLOB_DELTA: leave out of a delta bundle every config and layer an earlier bundle carried,
+    and any second copy within this bundle. images.json records, per image, where import finds each
+    one: an image the high registry already holds (target@digest), or bundle:<dir> in this bundle."""
+    known, holders, omitted, saved = state.get("blobs", {}), {}, {}, 0
+    # Two catalog tags can pin one digest: they share one staged directory, handled once.
+    for name in dict.fromkeys(image["transfer"].replace(":", "-") for image in changed):
+        directory = stage / "images" / name
+        for blob in sorted(image_blobs(directory)):
+            path = directory / blob[7:]
+            hint = holders.get(blob) or known.get(blob)
+            hint = [hint] if isinstance(hint, str) else hint  # recorded before lists
+            if hint is None:
+                holders[blob] = [f"bundle:{name}"]
+                continue
+            if path.exists():
+                saved += path.stat().st_size
+                path.unlink()
+            omitted.setdefault(name, {})[blob] = hint
+    if omitted:
+        metadata.update(schema=2, omitted=omitted)
+        print(f"blob delta: left out {sum(len(b) for b in omitted.values())} blob(s), {saved} bytes, "
+              "that the high side already has or this bundle carries once")
+
+
+def remember_blobs(state, changed, carried):
+    """Record every blob of the bundle's images against the images that hold it on the high side once
+    imported, newest first and at most three: if retention there expires one, import tries the next."""
+    blobs = state.setdefault("blobs", {})
+    for image in changed:
+        carrier = f"{image['target']}@{image['transfer']}"
+        for blob in carried[image["transfer"]]:
+            # Moved to the end on every use, so the oldest entries go first once the map is full.
+            blobs[blob] = [carrier, *[c for c in blobs.pop(blob, []) if c != carrier]][:3]
+    # ponytail: a fixed cap keeps the ledger small; a dropped blob is only sent again.
+    for blob in list(blobs)[:max(0, len(blobs) - BLOB_MEMORY)]:
+        del blobs[blob]
+
+
 def write_bundle(work, out, state_file, state, low, changed, full, kind, bridges=None):
     """Write the next bundle into the outbox and record it in the ledger. The ledger stays pending, so
     the next sync is full, until mirror.py send has delivered it.
@@ -1067,6 +1119,11 @@ def write_bundle(work, out, state_file, state, low, changed, full, kind, bridges
                             "docker://" + transport_reference(image["source"]))
                 (directory / f"{image['digest'][7:]}.manifest.json").write_bytes(index)
                 verify_platform(directory, image)
+        carried = {}
+        if flag("MIRROR_BLOB_DELTA"):
+            carried = {i["transfer"]: image_blobs(stage / "images" / i["transfer"].replace(":", "-")) for i in changed}
+            if kind == "delta":  # full and resend bundles carry every blob: they are how the high side recovers
+                omit_known_blobs(stage, changed, state, metadata)
         write_json(stage / "images.json", metadata)
         bundle = out / f"mirror-{state['stream']}-{state['sequence']:012d}.tar"
         # Written as parts of at most the cap straight from the tar writer; one part is the bundle itself.
@@ -1088,6 +1145,8 @@ def write_bundle(work, out, state_file, state, low, changed, full, kind, bridges
         temporary = out / (bundle.name + suffix + ".tmp")
         temporary.write_text(text)
         os.replace(temporary, out / (bundle.name + suffix))
+    if carried:
+        remember_blobs(state, changed, carried)
     if kind != "resend":  # a resend repeats what the ledger already records
         state["sent"].update({f"{i['target']}:{i['tag']}": f"{i['digest']} {platform}".strip() for i in changed})
         aliases = state.setdefault("aliases", {})
@@ -1368,7 +1427,8 @@ def extract(bundle, directory):
 
 
 def validate_manifest(manifest):
-    if (not isinstance(manifest, dict) or manifest.get("schema") != 1
+    if (not isinstance(manifest, dict) or manifest.get("schema") not in (1, 2)
+            or (manifest.get("schema") == 2) != ("omitted" in manifest)
             or not isinstance(manifest.get("stream"), str)
             or not re.fullmatch(r"[0-9a-f]{32}", manifest["stream"])
             or type(manifest.get("sequence")) is not int or manifest["sequence"] < 1
@@ -1377,6 +1437,17 @@ def validate_manifest(manifest):
             or ("from" in manifest and (type(manifest["from"]) is not int
                                         or not 1 <= manifest["from"] < manifest["sequence"]))):
         raise MirrorError("invalid bundle metadata")
+    directories = {image.get("transfer", "").replace(":", "-") for image in manifest["images"] if isinstance(image, dict)}
+    hint = re.compile(rf"bundle:sha256-[0-9a-f]{{64}}|{TARGET.pattern}@{DIGEST}")
+    omitted = manifest.get("omitted", {})
+    if not isinstance(omitted, dict):
+        raise MirrorError("invalid omitted-blob metadata")
+    for name, blobs in omitted.items():
+        if (name not in directories or not isinstance(blobs, dict) or not blobs
+                or not all(re.fullmatch(DIGEST, b) and isinstance(h, str) and hint.fullmatch(h)
+                           and (not h.startswith("bundle:") or h[7:] in directories)
+                for b, hints in blobs.items() for h in (hints if isinstance(hints, list) and hints else [None]))):
+            raise MirrorError("invalid omitted-blob metadata")
     seen = set()
     for image in manifest["images"]:
         fields = ('source', 'target', 'tag', 'digest', 'transfer')
@@ -1395,6 +1466,46 @@ def validate_manifest(manifest):
         if key in seen:
             raise MirrorError("duplicate target tag in bundle")
         seen.add(key)
+
+
+def verify_images(manifest, stage):
+    for image in manifest["images"]:
+        verify_image(stage / "images" / image["transfer"].replace(":", "-"), image["transfer"])
+        verify_platform(stage / "images" / image["transfer"].replace(":", "-"), image)
+
+
+def restore_blobs(stage, manifest, high, work):
+    """Put back each blob a MIRROR_BLOB_DELTA bundle left out: from another image in the bundle, or from an
+    image an earlier bundle brought, read out of the high registry, trying each named image in turn.
+    verify_image then checks every file."""
+    fetched, unreadable = {}, {}
+
+    def holder(hint):
+        if hint.startswith("bundle:"):
+            return stage / "images" / hint[7:]
+        if hint not in fetched and hint not in unreadable:
+            target, digest = hint.split("@", 1)
+            target = rewrite(target, "IMPORT_PATH_REWRITE")
+            directory = stage / "held" / f"{len(fetched) + len(unreadable)}"
+            directory.parent.mkdir(exist_ok=True)  # skopeo creates the dir: directory, not its parent
+            try:
+                copy(f"docker://{high}/{target}@{digest}", f"dir:{directory}", "TARGET_REGISTRY")
+                fetched[hint] = directory
+            except MirrorError as error:
+                unreadable[hint] = f"{target}@{digest}: {error}"
+        return fetched.get(hint)
+
+    for name, blobs in manifest.get("omitted", {}).items():
+        for blob, hints in sorted(blobs.items()):
+            source = next((d / blob[7:] for d in map(holder, hints) if d and (d / blob[7:]).is_file()), None)
+            if source is None:
+                why = "; ".join(unreadable.get(h, f"{h} does not hold it") for h in hints)
+                raise MirrorError(f"{blob} was left out as already on the high side, but none of its images has it "
+                                  f"({why}); on the low side, Run pipeline with RESEND_ALL=true to send whole images")
+            shutil.copyfile(source, stage / "images" / name / blob[7:])
+    if manifest.get("omitted"):
+        print(f"blob delta: restored {sum(len(b) for b in manifest['omitted'].values())} blob(s), "
+              f"reading {len(fetched)} image(s) from {high}")
 
 
 def import_one(bundle, adopt_stream=False, superseded_ok=False, record=None, unpack=None):
@@ -1418,9 +1529,8 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False, record=None, unp
                 raise MirrorError(f"{bundle.name}: the joined parts do not match the bundle checksum")
         manifest = json.loads((stage / "images.json").read_text())
         validate_manifest(manifest)
-        for image in manifest["images"]:
-            verify_image(stage / "images" / image["transfer"].replace(":", "-"), image["transfer"])
-            verify_platform(stage / "images" / image["transfer"].replace(":", "-"), image)
+        if "omitted" not in manifest:
+            verify_images(manifest, stage)
         receipt_file = work / "received.json"
         receipt = load_receipt(receipt_file)
         if receipt and receipt.get("registry") != high:
@@ -1446,6 +1556,10 @@ def import_one(bundle, adopt_stream=False, superseded_ok=False, record=None, unp
             raise SequenceGap(f"missing earlier bundle {missing} (imported up to {previous}, received "
                               f"{manifest['sequence']}); on the low side, Run pipeline with "
                               f"RESEND_SEQUENCE={previous + 1}.. (mirror.py resend --sequence {previous + 1}..)")
+        if "omitted" in manifest:
+            # Only once the sequence is accepted: the images it names come from earlier bundles.
+            restore_blobs(stage, manifest, high, work)
+            verify_images(manifest, stage)
         pushed = []
         for image in manifest["images"]:
             target = rewrite(image["target"], "IMPORT_PATH_REWRITE")
@@ -1781,6 +1895,8 @@ def main(argv=None):
     sync_command.add_argument("--all", action="store_true", help="bundle every approved image, not only changes")
     sync_command.add_argument("--out", help="outbox directory (default MIRROR_BUNDLE_DIR, else outbox/ in MIRROR_STATE_DIR)")
     sync_command.add_argument("--low-only", action="store_true", help="mirror into TARGET_REGISTRY without writing a bundle")
+    sync_command.add_argument("--blob-delta", action="store_true",
+                              help="leave out blobs the high side already has (or MIRROR_BLOB_DELTA=true)")
     send_command = command("send", "deliver the bundles sync or resend wrote, then remove them from the outbox",
                            "  mirror.py send nifi outbox                        # POST to NIFI_URL\n"
                            "  mirror.py send nifi --url https://nifi:9443/contentListener outbox\n"
@@ -1847,6 +1963,8 @@ def main(argv=None):
         elif args.command == "add":
             add_image(args.catalog, args.source, args.target)
         elif args.command == "sync":
+            if args.blob_delta:
+                os.environ["MIRROR_BLOB_DELTA"] = "true"
             sync(args.catalog, args.all, args.out, args.low_only)
         elif args.command == "send":
             for flag, variable in (("endpoint", "S3_ENDPOINT"), ("bucket", "S3_BUCKET"), ("prefix", "S3_PREFIX"),
