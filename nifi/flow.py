@@ -2,11 +2,14 @@
 """Build the NiFi flows that carry mirror-*.tar bundles across a one-way link to the high side. Stdlib only.
 
 usage: flow.py --side low|high [--url https://nifi:8443] [--user admin] [--password ...]
-               [--param name=value ...] [--insecure] [--export FILE]
+               [--param name=value ...] [--insecure] [--export FILE] [--source http|dir|s3] [--store gitlab|s3]
 
 low:  ListenHTTP :#{mirror.port}/contentListener   (sync and resend POST each bundle here, NIFI_URL)
         -> PackageFlowFile                       (keeps Filename and the X- headers with the content)
         -> PutFile #{mirror.diode}                 (the diode's ingress directory, as <file>.ffv3)
+low --source dir: ListFile #{mirror.drop} *.ffv3 -> FetchFile -> PutFile #{mirror.diode} -> DeleteFile
+low --source s3:  ListS3 #{s3.bucket}/#{s3.prefix} -> FetchS3Object -> PutFile #{mirror.diode} -> DeleteS3Object
+        (MIRROR_DROP=<dir> or MIRROR_DROP=s3: sync writes each bundle already packaged as <file>.ffv3)
 high: ListFile #{mirror.diode} -> FetchFile        (the diode's egress directory; deletes what it takes)
         -> UnpackContent flowfile-stream-v3      (the original file and its attributes again)
         -> RouteOnAttribute container-images     (X-Artifact-Type, X-Artifact-Action, a .tar or .tar.part-NNN)
@@ -28,9 +31,12 @@ import urllib.parse
 import urllib.request
 
 DEFAULTS = {"low": {"mirror.port": "9098", "mirror.diode": "/diode/mirror"},
+            "low-dir": {"mirror.drop": "/mnt/transfer", "mirror.diode": "/diode/mirror"},
+            "low-s3": {"mirror.diode": "/diode/mirror"},
             "high": {"mirror.diode": "/diode/mirror", "gitlab.api.url": "https://gitlab.example.com/api/v4",
                      "gitlab.container.projectId": "", "gitlab.container.branch": "main", "gitlab.container.token": ""}}
 # --store s3: the high side files bundles in an S3-compatible bucket instead of the generic package registry.
+# --source s3: the low side collects bundles from one. s3.ca (PEM text) is needed only for a private CA.
 S3_DEFAULTS = {"s3.endpoint": "", "s3.bucket": "", "s3.region": "us-east-1", "s3.prefix": "",
                "s3.access_key": "", "s3.secret_key": "", "s3.ca": ""}
 SENSITIVE = {"gitlab.container.token", "s3.access_key", "s3.secret_key"}
@@ -65,7 +71,9 @@ class Nifi:
         if not self.types:
             self.types = {t["type"]: t["bundle"] for t in self.call("GET", "/flow/processor-types")["processorTypes"]}
         full = next(t for t in self.types if t.endswith("." + type_name))
-        cfg = {"properties": self.resolve(full, props), "autoTerminatedRelationships": list(terminate),
+        b = self.types[full]
+        known = self.call("GET", f"/flow/processor-definition/{b['group']}/{b['artifact']}/{b['version']}/{full}")
+        cfg = {"properties": self.resolve(known, props), "autoTerminatedRelationships": list(terminate),
                "sensitiveDynamicPropertyNames": list(sensitive)}
         if schedule:
             cfg["schedulingPeriod"] = schedule
@@ -77,9 +85,11 @@ class Nifi:
         """Create a controller service in the group and enable it; its id goes in processor properties."""
         types = {t["type"]: t["bundle"] for t in self.call("GET", "/flow/controller-service-types")["controllerServiceTypes"]}
         full = next(t for t in types if t.endswith("." + type_name))
+        b = types[full]
+        known = self.call("GET", f"/flow/controller-service-definition/{b['group']}/{b['artifact']}/{b['version']}/{full}")
         created = self.call("POST", f"/process-groups/{pg}/controller-services",
                             {"revision": {"version": 0},
-                             "component": {"type": full, "bundle": types[full], "name": name, "properties": props}})
+                             "component": {"type": full, "bundle": b, "name": name, "properties": self.resolve(known, props)}})
         for _ in range(30):
             current = self.call("GET", f"/controller-services/{created['id']}")
             if current["component"]["validationStatus"] == "VALID":
@@ -91,11 +101,9 @@ class Nifi:
                   {"revision": current["revision"], "state": "ENABLED"})
         return created["id"]
 
-    def resolve(self, full, props):
+    def resolve(self, known, props):
         """Property keys as this NiFi names them. "A|B" tries each spelling, by name or display name,
         since NiFi versions rename properties. A key the processor does not define is dynamic and stays."""
-        b = self.types[full]
-        known = self.call("GET", f"/flow/processor-definition/{b['group']}/{b['artifact']}/{b['version']}/{full}")
         names = {}
         for key, descriptor in (known.get("propertyDescriptors") or {}).items():
             names[key] = names[descriptor.get("displayName", key)] = key
@@ -138,6 +146,69 @@ def replace_group(n, root, name, params):
                    "component": {"name": name, "position": {"x": 0, "y": 0}, "parameterContext": {"id": ctx["id"]}}})["id"]
 
 
+def s3_services(n, pg, params):
+    """The credentials and, for a private CA, the trust the S3 processors share."""
+    credentials = n.service(pg, "AWSCredentialsProviderControllerService", "S3 credentials",
+                            {"Access Key ID|Access Key": "#{s3.access_key}", "Secret Access Key|Secret Key": "#{s3.secret_key}"})
+    props = {"Region": "#{s3.region}", "Endpoint Override URL": "#{s3.endpoint}",
+             "AWS Credentials Provider Service|AWS Credentials Provider service": credentials}
+    if params["s3.ca"]:
+        props["SSL Context Service"] = n.service(pg, "PEMEncodedSSLContextProvider", "S3 CA", {
+            "Private Key Source": "UNDEFINED", "Certificate Authorities Source": "PROPERTIES",
+            "Certificate Authorities": "#{s3.ca}"})
+    return props
+
+
+def build_low_collect(n, pg, source, params):
+    """Collect what sync left in MIRROR_DROP, already a FlowFile package, and move it into the link."""
+    if source == "dir":
+        listing = n.processor(pg, "ListFile", "List the drop", 0,
+                              {"Input Directory": "#{mirror.drop}", "File Filter": r"mirror-.*\.ffv3",
+                               "Recurse Subdirectories": "false", "Minimum File Age": "5 sec"}, schedule="10 sec")
+        # Left in place until it is in the link, as the S3 flow does.
+        fetch = n.processor(pg, "FetchFile", "Take from the drop", 1, {"Completion Strategy": "None"},
+                            terminate=("not.found",))
+        n.connect(pg, fetch, fetch, ["failure", "permission.denied"])
+        ready = fetch
+    else:
+        s3 = s3_services(n, pg, params)
+        listing = n.processor(pg, "ListS3", "List the drop", 0,
+                              # NiFi refuses an empty Prefix, so it is set only when there is one.
+                              dict(s3, Bucket="#{s3.bucket}", **({"Prefix": "#{s3.prefix}"} if params["s3.prefix"] else {})),
+                              schedule="10 sec")
+        # ListS3 has no name filter; anything that is not a package stays in the bucket untouched.
+        packages = n.processor(pg, "RouteOnAttribute", "Packages only", 1, {
+            "Routing Strategy": "Route to Property name",
+            "package": "${filename:replaceAll('^.*/', ''):matches('mirror-.*[.]ffv3')}"}, terminate=("unmatched",))
+        fetch = n.processor(pg, "FetchS3Object", "Take from the drop", 2,
+                            dict(s3, **{"Bucket": "#{s3.bucket}", "Object Key": "${filename}"}))
+        # The key keeps its prefix; the file in the link takes the last part.
+        name = n.processor(pg, "UpdateAttribute", "Name the package", 3,
+                           {"mirror.key": "${filename}", "filename": "${filename:replaceAll('^.*/', '')}"})
+        n.connect(pg, listing, packages, ["success"])
+        n.connect(pg, packages, fetch, ["package"])
+        n.connect(pg, fetch, fetch, ["failure"])
+        n.connect(pg, fetch, name, ["success"])
+        ready = name
+    put = n.processor(pg, "PutFile", "Into the diode", 4,
+                      {"Directory": "#{mirror.diode}", "Conflict Resolution Strategy": "fail",
+                       "Create Missing Directories": "true"})
+    n.connect(pg, put, put, ["failure"])
+    if source == "dir":
+        n.connect(pg, listing, fetch, ["success"])
+    n.connect(pg, ready, put, ["success"])
+    # Removed from the drop only once it is in the link.
+    if source == "s3":
+        remove = n.processor(pg, "DeleteS3Object", "Remove from the drop", 5,
+                             dict(s3, **{"Bucket": "#{s3.bucket}", "Object Key": "${mirror.key}"}), terminate=("success",))
+    else:
+        remove = n.processor(pg, "DeleteFile", "Remove from the drop", 5,
+                             {"Directory Path": "${absolute.path}", "Filename": "${filename}"},
+                             terminate=("success", "not found"))
+    n.connect(pg, put, remove, ["success"])
+    n.connect(pg, remove, remove, ["failure"])
+
+
 def build_low(n, pg):
     listen = n.processor(pg, "ListenHTTP", "Receive bundle", 0,
                          {"Listening Port": "#{mirror.port}", "Base Path": "contentListener",
@@ -158,7 +229,7 @@ def build_low(n, pg):
     return [listen, remember, package, rename, put]
 
 
-def build_high(n, pg, store="gitlab"):
+def build_high(n, pg, store="gitlab", params=None):
     gitlab = "#{gitlab.api.url}/projects/#{gitlab.container.projectId}"
     listing = n.processor(pg, "ListFile", "List the diode", 0,
                           {"Input Directory": "#{mirror.diode}", "File Filter": r".*\.ffv3",
@@ -181,25 +252,18 @@ def build_high(n, pg, store="gitlab"):
     def uploader(name, y):
         if store == "s3":
             # The same <package>/<version>/<file> layout as the generic package, so import reads either store.
-            return n.processor(pg, "PutS3Object", name, y, {
-                "Bucket": "#{s3.bucket}", "Region": "#{s3.region}", "Endpoint Override URL": "#{s3.endpoint}",
+            # Only PutS3Object has this switch; NiFi's List, Fetch and Delete use path style with an endpoint override.
+            return n.processor(pg, "PutS3Object", name, y, dict(s3, **{
+                "Bucket": "#{s3.bucket}", "use-path-style-access|Use Path Style Access": "true",
                 # s3.prefix matches the pipeline's S3_PREFIX, kept with a trailing slash.
-                "Object Key": "#{s3.prefix}registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
-                "use-path-style-access": "true", "AWS Credentials Provider service": credentials,
-                "SSL Context Service": trust})
+                "Object Key": "#{s3.prefix}registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}"}))
         return n.processor(pg, "InvokeHTTP", name, y, {
             "HTTP Method": "PUT", "Request Body Enabled": "true",
             "HTTP URL": gitlab + "/packages/generic/registry-mirror-bundles/${filename:substringBefore('.tar')}/${filename}",
             "PRIVATE-TOKEN": "#{gitlab.container.token}", "Response Body Attribute Name": "gitlab.response"},
             terminate=("Response",), sensitive=("PRIVATE-TOKEN",))
 
-    credentials = trust = None
-    if store == "s3":
-        credentials = n.service(pg, "AWSCredentialsProviderControllerService", "S3 credentials",
-                                {"Access Key": "#{s3.access_key}", "Secret Key": "#{s3.secret_key}"})
-        trust = n.service(pg, "PEMEncodedSSLContextProvider", "S3 CA", {
-            "Private Key Source": "UNDEFINED", "Certificate Authorities Source": "PROPERTIES",
-            "Certificate Authorities": "#{s3.ca}"})
+    s3 = s3_services(n, pg, params) if store == "s3" else None
     upload = uploader("Upload the bundle", 6)
     # The checksum the low side sent, as the .sha256 import reads beside the bundle. A bundle sent in
     # parts carries the whole bundle's name, checksum and part count in X-Bundle-*; each part writes the
@@ -262,32 +326,38 @@ def main():
     ap.add_argument("--export", help="also write the group's flow definition to this file")
     ap.add_argument("--store", choices=("gitlab", "s3"), default="gitlab",
                     help="high side: where bundles wait for import (the pipeline's IMPORT_STORE)")
+    ap.add_argument("--source", choices=("http", "dir", "s3"), default="http",
+                    help="low side: how bundles arrive: POSTed (NIFI_URL), or left by MIRROR_DROP in a directory or S3")
     args = ap.parse_args()
     if not args.password:
         raise SystemExit("set --password or NIFI_PASSWORD")
-    defaults = dict(DEFAULTS[args.side], **(S3_DEFAULTS if args.store == "s3" else {}))
+    uses_s3 = args.store == "s3" if args.side == "high" else args.source == "s3"
+    side = args.side if args.side == "high" or args.source == "http" else f"low-{args.source}"
+    defaults = dict(DEFAULTS[side], **(S3_DEFAULTS if uses_s3 else {}))
     params = dict(defaults, **dict(p.split("=", 1) for p in args.param))
     if args.side == "high":
         params["gitlab.container.token"] = params["gitlab.container.token"] or os.environ.get("GITLAB_TOKEN", "")
         if not params["gitlab.container.projectId"] or not params["gitlab.container.token"]:
             raise SystemExit("high side needs --param gitlab.container.projectId=<id> and GITLAB_TOKEN")
-        if args.store == "s3":
-            params["s3.access_key"] = params["s3.access_key"] or os.environ.get("AWS_ACCESS_KEY_ID", "")
-            params["s3.secret_key"] = params["s3.secret_key"] or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-            params["s3.prefix"] = params["s3.prefix"].strip("/") + "/" if params["s3.prefix"].strip("/") else ""
-            if params["s3.ca"].startswith("@"):  # a PEM file, read here so the parameter holds the text
-                params["s3.ca"] = open(params["s3.ca"][1:], encoding="utf-8").read()
-            missing = [k for k in ("s3.endpoint", "s3.bucket", "s3.access_key", "s3.secret_key", "s3.ca") if not params[k]]
-            if missing:
-                raise SystemExit(f"--store s3 needs {', '.join(missing)} (keys from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)")
+    if uses_s3:
+        params["s3.access_key"] = params["s3.access_key"] or os.environ.get("AWS_ACCESS_KEY_ID", "")
+        params["s3.secret_key"] = params["s3.secret_key"] or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+        params["s3.prefix"] = params["s3.prefix"].strip("/") + "/" if params["s3.prefix"].strip("/") else ""
+        if params["s3.ca"].startswith("@"):  # a PEM file, read here so the parameter holds the text
+            params["s3.ca"] = open(params["s3.ca"][1:], encoding="utf-8").read()
+        missing = [k for k in ("s3.endpoint", "s3.bucket", "s3.access_key", "s3.secret_key") if not params[k]]
+        if missing:
+            raise SystemExit(f"S3 needs {', '.join(missing)} (keys from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)")
     n = Nifi(args.url, args.user, args.password, not args.insecure)
     n.login()
     root = n.call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
     pg = replace_group(n, root, f"registry mirror {args.side} side", params)
-    if args.side == "low":
+    if args.side == "high":
+        build_high(n, pg, args.store, params)
+    elif args.source == "http":
         build_low(n, pg)
     else:
-        build_high(n, pg, args.store)
+        build_low_collect(n, pg, args.source, params)
     # Start every processor but the two end points, whose queues are the record.
     n.call("PUT", f"/flow/process-groups/{pg}", {"id": pg, "state": "RUNNING"})
     for p in n.call("GET", f"/process-groups/{pg}/processors")["processors"]:
