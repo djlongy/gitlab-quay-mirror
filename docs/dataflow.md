@@ -20,9 +20,10 @@ flowchart LR
     C[images.txt] --> S[sync]
     SRC[(Source registries)] --> S
     S --> LT[(Low TARGET_REGISTRY)]
-    LT --> B[bundle]
+    LT --> B[outbox]
     S --> L[(Ledger)]
-    B --> NL[NiFi low]
+    B --> SE[send]
+    SE -- "POST, directory or S3" --> NL[NiFi low]
   end
   NL -- one-way link --> NH
   subgraph High side
@@ -97,12 +98,17 @@ ledger is first created; the sequence counts up from 1.
 
 ### 5. Send
 
-Sync posts the tar to `NIFI_URL` over HTTP/1.1, streamed from disk, with these headers, which
-NiFi keeps as attributes:
+Sync writes the bundle into the outbox (`--out`): the tar, or `<bundle>.part-001`, `.part-002`
+and so on when it is over `MIRROR_BUNDLE_MAX_SIZE`, each at most the cap, written straight from
+the tar writer. Then the `.sha256` and last a `.send.json` that marks the bundle complete. So no
+NiFi, link, store or HTTP limit sees a file larger than the cap. The runner needs room for the
+staged images and the bundle.
 
-| Header | Value |
+`mirror.py send <method> outbox` delivers each file with these attributes:
+
+| Attribute | Value |
 |---|---|
-| `Filename` | the file name |
+| `filename` (`Filename` header) | the file name |
 | `X-Sha256` | the file's SHA-256 |
 | `X-Artifact-Type` | `container-images` |
 | `X-Artifact-Format` | `tar` |
@@ -110,22 +116,16 @@ NiFi keeps as attributes:
 | `X-Bundle-Kind` | `delta`, `full` or `resend` |
 | `X-Bundle-Name`, `X-Bundle-Sha256`, `X-Bundle-Parts` | a part only: the whole bundle's name, SHA-256 and number of parts |
 
-A bundle over `MIRROR_BUNDLE_MAX_SIZE` (one image larger than the cap) goes as
-`<bundle>.part-001`, `.part-002` and so on, each at most the cap. Sync measures the tar in a
-first pass, then writes it straight into parts, posting and deleting each as it fills: the
-runner holds the staged images and one part, never the whole tar. So no NiFi, link, store or
-HTTP limit sees a file larger than the cap. NiFi answers 503 while its queue is full; sync
-retries with backoff for about 17 minutes.
+- `send nifi` POSTs to `--url`/`NIFI_URL` over HTTP/1.1, streamed from disk, with the attributes as
+  headers. NiFi answers 503 while its queue is full; send retries with backoff for about 17 minutes.
+  Logs `posted to NiFi: <file> -> <url> (HTTP 200, <bytes>, X-Sha256 ...)`.
+- `send dir` and `send s3` write `<file>.ffv3`: the file with the attributes packaged in FlowFile v3
+  format, as PackageFlowFile would. A directory gets it as `.ffv3.partial`, renamed once complete;
+  S3 gets one object, with the attributes also as user metadata. Logs `dropped for NiFi: ...`.
+- `send dir --format tar` copies the plain bundle and then its `.sha256`, for `import --inbox`.
 
-Each accepted post logs `posted to NiFi: <file> -> <url> (HTTP 200, <bytes>, X-Sha256 ...)`.
-Once NiFi accepts the bundle, sync records its images as sent in the ledger.
-With `MIRROR_DROP` instead of `NIFI_URL`, sync does not post. It writes each file with the same
-attributes already packaged in FlowFile v3 format, as `<file>.ffv3`, into the directory (renamed
-from `.ffv3.partial` once complete) or as an object in the `S3_*` bucket, and logs
-`dropped for NiFi: ...`. The low NiFi lists and collects it (step 6).
-Without either, a set `MIRROR_BUNDLE_DIR` keeps the bundle for hand-carry. With neither,
-sync updates the low registry only, records nothing as sent, and the next run with a
-destination sends those images.
+Each file is deleted from the outbox once delivered, and each bundle logs `sent: <bundle>`. When the
+outbox is empty, send sets the ledger's `pending` to false.
 
 ### 6. NiFi low
 
@@ -133,7 +133,7 @@ NiFi's ListenHTTP receives each file. PackageFlowFile wraps the content and its 
 FlowFile v3 format, and PutFile writes it into the link as `<file>.ffv3`. The attributes cross
 the link inside the package.
 
-With `MIRROR_DROP` the package already exists: ListFile and FetchFile (a directory) or ListS3
+With `send dir` or `send s3` the package already exists: ListFile and FetchFile (a directory) or ListS3
 and FetchS3Object (a bucket) collect `mirror-*.ffv3`, PutFile writes it into the link unchanged,
 and both flows then delete the source file or object.
 
@@ -224,8 +224,9 @@ helm template chart/ -f values.yaml | python3 mirror.py covers -
 | `targets` | either | Validates and lists the catalog |
 | `pending` | low | Lists what the next sync sends |
 | `login` | either | Logs in to `TARGET_REGISTRY`, and `SOURCE_REGISTRY` when it has credentials |
-| `sync` | low | Steps 3 to 5 |
-| `resend` | low | Rebuilds recorded images as the next bundle |
+| `sync` | low | Steps 3 to 5: writes bundles to the outbox |
+| `send` | low | Step 5: delivers the outbox to NiFi (`nifi`, `dir`, `s3`) or for hand-carry (`dir --format tar`) |
+| `resend` | low | Rebuilds recorded images as the next bundle in the outbox |
 | `covers` | low | Checks Containerfiles and manifests against the catalog |
 | `import` | high | Step 8, from `IMPORT_STORE`, a directory or one file |
 | `promote` | high | Step 9, dev to prod by digest |

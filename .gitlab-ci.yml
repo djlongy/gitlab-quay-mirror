@@ -23,6 +23,11 @@ variables:
   RESEND_SINCE: ''
   RESEND_SEQUENCE: ''
   RESEND_IMAGE: ''
+  # How sync's bundles leave: nifi (POST to NIFI_URL), dir (.ffv3 files in MIRROR_SEND_PATH, e.g. an NFS
+  # share mounted on the runner, for a low NiFi ListFile) or s3 (.ffv3 objects in S3_BUCKET at S3_ENDPOINT,
+  # S3_PREFIX optional, keys in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, for a low NiFi ListS3).
+  MIRROR_SEND: 'nifi'
+  MIRROR_SEND_PATH: ''
 
 verify:
   stage: verify
@@ -118,7 +123,7 @@ scan:
     paths: [sbom/]
     expire_in: 1 week
 
-# A runner with python3, skopeo and curl. Bundles go to NiFi and are deleted once it accepts them.
+# A runner with python3, skopeo and curl. sync writes bundles to outbox/, send delivers and deletes them.
 # Merge-request validation runs elsewhere, without registry credentials.
 sync: &mirror
   stage: publish
@@ -144,10 +149,11 @@ sync: &mirror
     - python3 mirror.py login
     - |
       if [ "$RESEND_ALL" = "true" ]; then
-        python3 mirror.py sync --all
+        python3 mirror.py sync --all --out outbox
       else
-        python3 mirror.py sync
+        python3 mirror.py sync --out outbox
       fi
+    - python3 mirror.py send "$MIRROR_SEND" outbox ${MIRROR_SEND_PATH:+--path "$MIRROR_SEND_PATH"}
     # Keep each sent image's SBOM and scan report, by digest, for audit.
     - |
       for file in sbom/*.json; do
@@ -158,7 +164,7 @@ sync: &mirror
         echo "kept: registry-mirror-sbom/$version/$base"
       done
   after_script:
-    - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/.mirror-work"
+    - rm -rf "$CI_PROJECT_DIR/.registry-auth.json" "$CI_PROJECT_DIR/.mirror-work" "$CI_PROJECT_DIR/outbox"
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never
@@ -191,7 +197,8 @@ resend:
       artifacts: false
   script:
     - python3 mirror.py login
-    - python3 mirror.py resend ${RESEND_SINCE:+--since "$RESEND_SINCE"} ${RESEND_SEQUENCE:+--sequence "$RESEND_SEQUENCE"} ${RESEND_IMAGE:+--image "$RESEND_IMAGE"}
+    - python3 mirror.py resend --out outbox ${RESEND_SINCE:+--since "$RESEND_SINCE"} ${RESEND_SEQUENCE:+--sequence "$RESEND_SEQUENCE"} ${RESEND_IMAGE:+--image "$RESEND_IMAGE"}
+    - python3 mirror.py send "$MIRROR_SEND" outbox ${MIRROR_SEND_PATH:+--path "$MIRROR_SEND_PATH"}
   rules:
     - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH || $CI_COMMIT_REF_PROTECTED != "true"'
       when: never

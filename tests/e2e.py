@@ -42,10 +42,10 @@ def last_bundle():
     return max(outbox.glob('mirror-*.tar'))
 
 
-def transfer(bundle):
-    for path in (bundle, bundle.with_name(bundle.name + '.sha256')):
-        shutil.copy2(path, inbox / path.name)
-    return inbox / bundle.name
+def transfer(bundle, to=None):
+    """mirror.py send dir --format tar: the hand-carry path into the high inbox (or somewhere lost)."""
+    cli('send', 'dir', '--path', str(to or inbox), '--format', 'tar')
+    return (to or inbox) / bundle.name
 
 
 def compare(image):
@@ -137,7 +137,8 @@ if __name__ == '__main__':
         assert report[0]['image'].endswith(':' + expected_tag), report
         # Losing a subsequent new-image bundle must be detected on the high side.
         cli('add', source, target + '-second')
-        cli('sync')  # deliberately lose this delta
+        cli('sync')
+        transfer(last_bundle(), to=directory / 'lost')  # deliberately lose this delta
         cli('add', source, target + '-third')
         cli('sync')
         missing = transfer(last_bundle())
@@ -149,10 +150,12 @@ if __name__ == '__main__':
         cli('import', str(first), fail='refusing rollback')
         report = [compare(image) for image in mirror.catalog(catalog)]
         # Checksum failure cannot be disguised as successful delivery.
+        pristine = directory / 'pristine.tar'
+        shutil.copy2(recovery, pristine)
         with recovery.open('ab') as stream:
             stream.write(b'corrupt')
         cli('import', str(recovery), fail='mismatched checksum')
-        shutil.copy2(last_bundle(), recovery)
+        shutil.copy2(pristine, recovery)
         cli('import', '--inbox', str(inbox))
         assert not list(inbox.glob('*.tar')), 'completed/superseded bundles must leave the inbox'
         with tarfile.open(inbox / 'done' / first.name) as archive:

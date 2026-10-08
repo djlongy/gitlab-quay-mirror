@@ -4,12 +4,14 @@
 usage: flow.py --side low|high [--url https://nifi:8443] [--user admin] [--password ...]
                [--param name=value ...] [--insecure] [--export FILE] [--source http|dir|s3] [--store gitlab|s3]
 
-low:  ListenHTTP :#{mirror.port}/contentListener   (sync and resend POST each bundle here, NIFI_URL)
+low:  ListenHTTP :#{mirror.port}/contentListener   (mirror.py send nifi POSTs each bundle here, NIFI_URL)
         -> PackageFlowFile                       (keeps Filename and the X- headers with the content)
         -> PutFile #{mirror.diode}                 (the diode's ingress directory, as <file>.ffv3)
 low --source dir: ListFile #{mirror.drop} *.ffv3 -> FetchFile -> PutFile #{mirror.diode} -> DeleteFile
 low --source s3:  ListS3 #{s3.bucket}/#{s3.prefix} -> FetchS3Object -> PutFile #{mirror.diode} -> DeleteS3Object
-        (MIRROR_DROP=<dir> or MIRROR_DROP=s3: sync writes each bundle already packaged as <file>.ffv3)
+        (mirror.py send dir / send s3 write each bundle already packaged as <file>.ffv3)
+low --check (dir or s3): ... -> UnpackContent -> CryptographicHashContent -> X-Sha256 matches
+        -> PackageFlowFile -> PutFile ...    (the low side sees the X- attributes and checks the content)
 high: ListFile #{mirror.diode} -> FetchFile        (the diode's egress directory; deletes what it takes)
         -> UnpackContent flowfile-stream-v3      (the original file and its attributes again)
         -> RouteOnAttribute container-images     (X-Artifact-Type, X-Artifact-Action, a .tar or .tar.part-NNN)
@@ -159,8 +161,10 @@ def s3_services(n, pg, params):
     return props
 
 
-def build_low_collect(n, pg, source, params):
-    """Collect what sync left in MIRROR_DROP, already a FlowFile package, and move it into the link."""
+def build_low_collect(n, pg, source, params, check=False):
+    """Collect what mirror.py send dir or send s3 left, already a FlowFile package, and move it into the
+    link. check: unpack it first, so the low side sees the X- attributes and verifies X-Sha256, then
+    package it again."""
     if source == "dir":
         listing = n.processor(pg, "ListFile", "List the drop", 0,
                               {"Input Directory": "#{mirror.drop}", "File Filter": r"mirror-.*\.ffv3",
@@ -190,8 +194,11 @@ def build_low_collect(n, pg, source, params):
         n.connect(pg, fetch, fetch, ["failure"])
         n.connect(pg, fetch, name, ["success"])
         ready = name
+    if check:
+        ready = low_check(n, pg, ready)
+    # A file sent twice (a send rerun after a lost reply) has the same name and content: replace it.
     put = n.processor(pg, "PutFile", "Into the diode", 4,
-                      {"Directory": "#{mirror.diode}", "Conflict Resolution Strategy": "fail",
+                      {"Directory": "#{mirror.diode}", "Conflict Resolution Strategy": "replace",
                        "Create Missing Directories": "true"})
     n.connect(pg, put, put, ["failure"])
     if source == "dir":
@@ -209,6 +216,32 @@ def build_low_collect(n, pg, source, params):
     n.connect(pg, remove, remove, ["failure"])
 
 
+def low_check(n, pg, ready):
+    """Unpack, route and hash-check on the low side, then package again under the name it arrived with.
+    The unpacked file keeps the attributes of the package it came from (absolute.path, mirror.key), so
+    removing it from the drop afterwards still works."""
+    keep = n.processor(pg, "UpdateAttribute", "Remember the package name", 10, {"drop.name": "${filename}"})
+    unpack = n.processor(pg, "UnpackContent", "Restore file and attributes", 11,
+                         {"Packaging Format": "flowfile-stream-v3"}, terminate=("original",))
+    hashing = n.processor(pg, "CryptographicHashContent", "Hash file", 12, {"Hash Algorithm": "SHA-256"})
+    verified = n.processor(pg, "RouteOnAttribute", "Container bundle matching X-Sha256", 13, {
+        "Routing Strategy": "Route to Property name",
+        "verified": "${X-Artifact-Type:equals('container-images'):and(${content_SHA-256:equals(${X-Sha256})})}"})
+    package = n.processor(pg, "PackageFlowFile", "Package again", 14, {}, terminate=("original",))
+    rename = n.processor(pg, "UpdateAttribute", "Name the package again", 15, {"filename": "${drop.name}"})
+    rejected = n.processor(pg, "UpdateAttribute", "Rejected (inspect queue)", 16, {})
+    n.connect(pg, ready, keep, ["success"])
+    n.connect(pg, keep, unpack, ["success"])
+    n.connect(pg, unpack, hashing, ["success"])
+    n.connect(pg, unpack, rejected, ["failure"])
+    n.connect(pg, hashing, verified, ["success"])
+    n.connect(pg, hashing, rejected, ["failure"])
+    n.connect(pg, verified, package, ["verified"])
+    n.connect(pg, verified, rejected, ["unmatched"])
+    n.connect(pg, package, rename, ["success"])
+    return rename
+
+
 def build_low(n, pg):
     listen = n.processor(pg, "ListenHTTP", "Receive bundle", 0,
                          {"Listening Port": "#{mirror.port}", "Base Path": "contentListener",
@@ -218,8 +251,9 @@ def build_low(n, pg):
     package = n.processor(pg, "PackageFlowFile", "Keep attributes across the diode", 2, {}, terminate=("original",))
     # PackageFlowFile names its output by UUID; the package itself still carries the original filename.
     rename = n.processor(pg, "UpdateAttribute", "Name the package", 3, {"filename": "${diode.name}.ffv3"})
+    # A file sent twice (a send rerun after a lost reply) has the same name and content: replace it.
     put = n.processor(pg, "PutFile", "Into the diode", 4,
-                      {"Directory": "#{mirror.diode}", "Conflict Resolution Strategy": "fail",
+                      {"Directory": "#{mirror.diode}", "Conflict Resolution Strategy": "replace",
                        "Create Missing Directories": "true"}, terminate=("success",))
     n.connect(pg, listen, remember, ["success"])
     n.connect(pg, remember, package, ["success"])
@@ -327,8 +361,12 @@ def main():
     ap.add_argument("--store", choices=("gitlab", "s3"), default="gitlab",
                     help="high side: where bundles wait for import (the pipeline's IMPORT_STORE)")
     ap.add_argument("--source", choices=("http", "dir", "s3"), default="http",
-                    help="low side: how bundles arrive: POSTed (NIFI_URL), or left by MIRROR_DROP in a directory or S3")
+                    help="low side: how bundles arrive: mirror.py send nifi (POST), send dir or send s3")
+    ap.add_argument("--check", action="store_true",
+                    help="low side with --source dir or s3: unpack each package, verify X-Sha256, package it again")
     args = ap.parse_args()
+    if args.check and (args.side == "high" or args.source == "http"):
+        raise SystemExit("--check is for --side low with --source dir or s3; ListenHTTP already has the attributes")
     if not args.password:
         raise SystemExit("set --password or NIFI_PASSWORD")
     uses_s3 = args.store == "s3" if args.side == "high" else args.source == "s3"
@@ -357,7 +395,7 @@ def main():
     elif args.source == "http":
         build_low(n, pg)
     else:
-        build_low_collect(n, pg, args.source, params)
+        build_low_collect(n, pg, args.source, params, args.check)
     # Start every processor but the two end points, whose queues are the record.
     n.call("PUT", f"/flow/process-groups/{pg}", {"id": pg, "state": "RUNNING"})
     for p in n.call("GET", f"/process-groups/{pg}/processors")["processors"]:

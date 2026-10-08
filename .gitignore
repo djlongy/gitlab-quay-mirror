@@ -13,3 +13,4 @@ __pycache__/
 *.tar.sha256
 .registry-auth.json
 AGENTS.md
+outbox/

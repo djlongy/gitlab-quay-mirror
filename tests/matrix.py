@@ -37,8 +37,8 @@ with tempfile.TemporaryDirectory(prefix="registry-mirror-matrix-") as temporary:
 
     for number, source in enumerate(sys.argv[1:]):
         cli("add", source, f"{prefix}/{number}/{source.split('@')[0].rsplit(':', 1)[0].rsplit('/', 1)[-1]}")
-    cli("sync")
-    bundle = next((directory / "work" / "bundles").glob("mirror-*.tar"))
+    cli("sync", "--out", str(directory / "out"))
+    bundle = next((directory / "out").glob("mirror-*.tar"))
     cli("import", str(bundle))
     with tarfile.open(bundle) as archive:
         entries = json.load(archive.extractfile("images.json"))["images"]

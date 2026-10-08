@@ -2,7 +2,7 @@
 
 Mirrors reviewed container images and Helm charts into a registry on a connected low side, then carries them in verified bundles across a one-way link into a registry on an isolated high side. Any OCI registry works on either side: Quay, Harbor, GitLab, Artifactory, Nexus or `registry:2`. [Quickstart](QUICKSTART.md).
 
-Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` (`sync`), bundle to `NIFI_URL`, across the link, NiFi files it in `IMPORT_STORE`, then `import` pushes it to the high `TARGET_REGISTRY`. Each project sets `TARGET_REGISTRY` to its own side's registry. `docs/dataflow.md` walks through every step.
+Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` and a bundle of what changed (`sync`), bundle to the low NiFi (`send`), across the link, NiFi files it in `IMPORT_STORE`, then `import` pushes it to the high `TARGET_REGISTRY`. Each project sets `TARGET_REGISTRY` to its own side's registry. `docs/dataflow.md` walks through every step.
 
 ## Requirements
 
@@ -12,21 +12,22 @@ Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` 
 
 ## Low side: pull, save, send
 
-`sync` copies each `images.txt` entry from its source into `TARGET_REGISTRY` by digest, then posts a bundle of what changed to `NIFI_URL`. Set these in **Settings > CI/CD > Variables**; mask the secrets and scope them to environment `mirror-low`.
+`sync` copies each `images.txt` entry from its source into `TARGET_REGISTRY` by digest and writes what changed as a bundle in an outbox; `send` delivers the outbox to the low NiFi and empties it. The pipeline runs both, one after the other, so you can see and change each step in `.gitlab-ci.yml`. Set these in **Settings > CI/CD > Variables**; mask the secrets and scope them to environment `mirror-low`.
 
 | Req | Name | Default | Purpose |
 |---|---|---|---|
 | Required | `TARGET_REGISTRY` | none | Low registry, `host[:port]` |
 | Required | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account that can push; leave unset for a registry without auth |
-| Required, one of | `NIFI_URL` | none | NiFi ListenHTTP the bundles are posted to |
-| Required, one of | `MIRROR_DROP` | none | Instead of posting: a directory the low NiFi lists (an NFS share such as `/mnt/transfer`), or `s3` for a bucket it lists. See [Low side without ListenHTTP](#low-side-without-listenhttp) |
-| With `MIRROR_DROP=s3` | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; optional `S3_PREFIX`, `S3_REGION`, `S3_CA_BUNDLE`, `S3_TLS_VERIFY` | none | The low-side bucket |
+| Required | `MIRROR_SEND` | `nifi` | How bundles leave: `nifi`, `dir` or `s3`. See [Send](#send) |
+| `MIRROR_SEND=nifi` | `NIFI_URL` | none | NiFi ListenHTTP the bundles are posted to |
+| `MIRROR_SEND=dir` | `MIRROR_SEND_PATH` | none | Directory the low NiFi lists, e.g. an NFS share at `/mnt/transfer` mounted on the runner |
+| `MIRROR_SEND=s3` | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; optional `S3_PREFIX`, `S3_REGION`, `S3_CA_BUNDLE`, `S3_TLS_VERIFY` | none | The low-side bucket the low NiFi lists |
 | Optional | `TARGET_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
 | Optional | `SOURCE_REGISTRY`, `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD`, `SOURCE_REGISTRY_TLS_VERIFY` | none | Login and TLS setting for one source registry, for example `docker.io` against rate limits; other source hosts pull anonymously with TLS verified |
 | Optional | `MIRROR_PLATFORM` | all platforms | One platform, for example `linux/amd64` |
 | Optional | `MIRROR_SCAN`, `GRYPE_FAIL_ON` | `true`, `critical` | Syft SBOM and Grype gate before `sync`; `false` skips both |
 | Optional | `SYFT_IMAGE`, `GRYPE_IMAGE` | `docker.io/anchore/syft:v1.54.0-debug`, `docker.io/anchore/grype:v0.120.0-debug` | Scanner images |
-| Optional | `MIRROR_BUNDLE_DIR` | none | Keep bundles in a directory for hand-carry instead of NiFi |
+| Optional | `MIRROR_BUNDLE_DIR` | `outbox/` in `MIRROR_STATE_DIR` | Outbox when `--out` is not given (the pipeline passes `--out outbox`) |
 | Optional | `MIRROR_BUNDLE_MAX_SIZE` | `4GiB` | Largest file that leaves the low side: images are grouped into bundles up to this size, and a bundle over it (one larger image) goes in parts. Keep it under the high store's file limit (GitLab: 5 GiB by default) |
 | Run pipeline | `RESEND_ALL`, `RESEND_SEQUENCE`, `RESEND_SINCE`, `RESEND_IMAGE` | none | Recovery, see [Resend](#resend) |
 
@@ -47,28 +48,51 @@ python3 mirror.py add-list lists/ --prefix team   # lists/monitoring.txt: prom/p
 
 A latest-only image also gets the version it reports, so `latest` can move while `8.10.2` stays. An image whose source is `TARGET_REGISTRY` itself is only verified there and sent, with that registry's login and TLS settings; no `SOURCE_REGISTRY` setting is needed. Renovate proposes updates as merge requests for the registries it can reach; `scan` must pass before one merges.
 
-You know it works when the `sync` log shows `pushed to target registry: <host>/team/prometheus:v3.13.4@sha256:...` and `posted to NiFi: mirror-<stream>-<n>.tar -> <NIFI_URL> (HTTP 200, ...)`.
+You know it works when the `sync` log shows `pushed to target registry: <host>/team/prometheus:v3.13.4@sha256:...` and the `send` log shows `posted to NiFi: mirror-<stream>-<n>.tar -> <NIFI_URL> (HTTP 200, ...)` (or `dropped for NiFi: ...`), then `sent: mirror-<stream>-<n>.tar`.
 
-### Low side without ListenHTTP
+### Send
 
-When the runner cannot reach a NiFi listener, or NiFi should pull instead of being pushed to, set
-`MIRROR_DROP`. Sync then writes each bundle (or part) as `<file>.ffv3`: the file already packaged
-in NiFi's FlowFile v3 format with `filename` and the `X-` attributes NiFi would have taken from
-the headers. The low NiFi only collects it and moves it into the link, and the high side is
-unchanged.
+`sync --out outbox` writes each bundle as `mirror-<stream>-<n>.tar` (or `.part-001`, `.part-002`... when
+it is over `MIRROR_BUNDLE_MAX_SIZE`), its `.sha256`, and last a `.send.json` that marks it complete.
+`send <method> outbox` delivers every complete bundle, oldest first, and deletes each file once it is
+delivered, recording each in the `.send.json`. A send that stops part-way leaves only what it has not
+delivered: run it again. The ledger lists every bundle written and not yet sent and stays pending
+while that list is not empty, so if the outbox is lost (a failed CI job) the next `sync` is full and
+the high side catches up; a full bundle or a resend that bridges replaces the list. `sync` refuses an
+outbox that still holds unsent bundles. Hand-carry counts as sent once copied: a lost USB stick shows
+up as a gap on the high side, recovered with a resend.
 
-| `MIRROR_DROP` | Sync writes | Low NiFi flow |
+```sh
+python3 mirror.py sync --out outbox
+python3 mirror.py send nifi --url https://nifi.low:9443/contentListener outbox   # default NIFI_URL
+python3 mirror.py send dir --path /mnt/transfer outbox                             # NFS share for NiFi
+python3 mirror.py send s3 --bucket transfer --prefix mirror outbox                 # S3_* and AWS_* env
+python3 mirror.py send dir --path /media/usb --format tar outbox                   # hand-carry
+```
+
+Flags win over the environment; the environment only fills in what a flag leaves out.
+
+| Method | What arrives | Low NiFi flow |
 |---|---|---|
-| a directory, e.g. `/mnt/transfer` | `<file>.ffv3.partial`, renamed to `<file>.ffv3` once complete | `flow.py --side low --source dir --param mirror.drop=/mnt/transfer`: ListFile `mirror-*.ffv3`, FetchFile, PutFile into the link, then DeleteFile |
-| `s3` | `PUT <S3_PREFIX>/<file>.ffv3` | `flow.py --side low --source s3 --param s3.endpoint=... --param s3.bucket=... --param s3.prefix=...`: ListS3, FetchS3Object, PutFile into the link, then DeleteS3Object |
+| `nifi` | HTTP POST, the attributes as `X-` headers | `flow.py --side low`: ListenHTTP, PackageFlowFile, PutFile into the link |
+| `dir` | `<file>.ffv3`: the file packaged in NiFi's FlowFile v3 format with `filename` and the same `X-` attributes, written as `.ffv3.partial` and renamed when complete | `flow.py --side low --source dir --param mirror.drop=/mnt/transfer`: ListFile `mirror-*.ffv3`, FetchFile, PutFile into the link, then DeleteFile |
+| `s3` | `<S3_PREFIX>/<file>.ffv3`, the same package, with the attributes also as S3 user metadata | `flow.py --side low --source s3 --param s3.endpoint=... --param s3.bucket=... [--param s3.prefix=...]`: ListS3, FetchS3Object, PutFile into the link, then DeleteS3Object |
+| `dir --format tar` | the plain bundle and its `.sha256`, for `import --inbox` | none: carried by hand. Needs whole bundles, so set `MIRROR_BUNDLE_MAX_SIZE` above the largest |
 
-- Directory: mount the same share on the runner (a shell runner, or a `volumes` entry in a Docker
-  runner's config) and in NiFi. NiFi's user must be able to read the files and delete them from
-  the directory.
-- S3: NiFi reads the keys from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` when you run
-  `flow.py`, and `s3.ca=@ca.pem` is needed only for a private CA. NiFi's ListS3, FetchS3Object
-  and DeleteS3Object use path-style requests when an endpoint is set.
-- Sync logs `dropped for NiFi: <file>.ffv3 -> <directory or bucket> (<bytes>, X-Sha256 ...)`.
+- The high side is the same for every method: the attributes cross the link inside the FlowFile package.
+- To see the attributes on the low side too, and check each file there before it enters the link, add
+  `--check` to `flow.py --side low --source dir|s3`: UnpackContent, CryptographicHashContent, a route
+  on `X-Artifact-Type` and `X-Sha256`, then PackageFlowFile again. A file that fails waits in
+  "Rejected (inspect queue)" and stays in the drop. With `s3` the attributes are also the object's
+  user metadata, which FetchS3Object turns into attributes without unpacking.
+- `dir`: mount the share on the runner (a shell runner, or a `volumes` entry in a Docker runner's
+  config) and in NiFi. NiFi's user must be able to read and delete the files.
+- `s3`: `flow.py` reads the keys from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; `s3.ca=@ca.pem`
+  only for a private CA. NiFi's ListS3, FetchS3Object and DeleteS3Object use path-style requests
+  when an endpoint is set.
+- One file per bundle: set `MIRROR_BUNDLE_MAX_SIZE` above the largest image (for example `100GiB`).
+  Keep it under what the high store takes: a GitLab generic package is 5 GiB by default, S3 has no
+  practical limit.
 
 ## High side: receive, load, push
 
@@ -144,7 +168,7 @@ The high side cannot ask for a bundle over a one-way link, so a lost one is rese
 ## Behaviour
 
 - Nothing persists on a runner. The ledger (`registry-mirror-ledger`), SBOMs (`registry-mirror-sbom`) and receipt (`registry-mirror-receipt`) live in the package registry or the bucket; images live in the registries.
-- A bundle is recorded as sent only once NiFi accepts it or it is written to `MIRROR_BUNDLE_DIR`. With neither, `sync` updates the low registry and prints `not sent to the high side`.
+- `sync` records a bundle in the ledger when it writes it; the ledger stays pending until `send` empties the outbox. `sync --low-only` updates the low registry, records nothing and prints `not bundled (--low-only)`.
 - `sync` and `resend` run only where `TARGET_REGISTRY` is set, so the source project runs the tests and scan only.
 - Import refuses a replayed older bundle and a gap in the sequence, and reports a duplicate trigger as `already imported`.
 
