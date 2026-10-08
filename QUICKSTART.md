@@ -6,7 +6,7 @@
 
 Low side:
 
-1. Add an image: `python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus`, then merge `images.txt`.
+1. Add an image: `python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus`, or many at once from `.txt` lists: `python3 mirror.py add-list lists/ --prefix team`. Then merge `images.txt`.
 2. In **Settings > CI/CD > Variables**, set `TARGET_REGISTRY`, `NIFI_URL`, and masked `TARGET_REGISTRY_USERNAME` and `TARGET_REGISTRY_PASSWORD` scoped to `mirror-low`.
 3. Select **Build > Pipelines > Run pipeline** on the default branch.
 

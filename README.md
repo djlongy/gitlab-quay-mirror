@@ -25,6 +25,7 @@ Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` 
 | Optional | `MIRROR_SCAN`, `GRYPE_FAIL_ON` | `true`, `critical` | Syft SBOM and Grype gate before `sync`; `false` skips both |
 | Optional | `SYFT_IMAGE`, `GRYPE_IMAGE` | `docker.io/anchore/syft:v1.54.0-debug`, `docker.io/anchore/grype:v0.120.0-debug` | Scanner images |
 | Optional | `MIRROR_BUNDLE_DIR` | none | Keep bundles in a directory for hand-carry instead of NiFi |
+| Optional | `MIRROR_BUNDLE_MAX_SIZE` | `4GiB` | Largest file that leaves the low side: images are grouped into bundles up to this size, and a bundle over it (one larger image) goes in parts. Keep it under the high store's file limit (GitLab: 5 GiB by default) |
 | Run pipeline | `RESEND_ALL`, `RESEND_SEQUENCE`, `RESEND_SINCE`, `RESEND_IMAGE` | none | Recovery, see [Resend](#resend) |
 
 Add each image by the tag you run; `add` pins its current digest in `images.txt`:
@@ -34,6 +35,12 @@ python3 mirror.py add docker.io/prom/prometheus:v3.13.4 team/prometheus
 python3 mirror.py add docker.io/bitnami/redis:latest team/redis            # also tagged with the version it reports
 python3 mirror.py add docker.io/bitnamicharts/redis:22.0.7 charts/redis    # an OCI Helm chart
 python3 mirror.py add registry.low.example.com/team/runner:1.2 team/runner   # your own image, already in TARGET_REGISTRY
+```
+
+To add many at once, list them in `.txt` files, one per line, and run `add-list` on the folder. A line without a registry host is read as `docker pull` reads it (`alpine` is `docker.io/library/alpine`), a line without a tag gets `:latest`, and each is written to `images.txt` in full with its digest. Each target is the source path without the host, under `--prefix` if given. `images.txt` is kept sorted by source; lines already present are skipped, and a line that fails is reported while the rest are still added:
+
+```sh
+python3 mirror.py add-list lists/ --prefix team   # lists/monitoring.txt: prom/prometheus:v3.13.4 -> team/prom/prometheus
 ```
 
 A latest-only image also gets the version it reports, so `latest` can move while `8.10.2` stays. An image whose source is `TARGET_REGISTRY` itself is only verified there and sent, with that registry's login and TLS settings; no `SOURCE_REGISTRY` setting is needed. Renovate proposes updates as merge requests for the registries it can reach; `scan` must pass before one merges.
@@ -56,10 +63,18 @@ NiFi files each bundle in `IMPORT_STORE` and starts the pipeline with `BUNDLE`; 
 | Optional | `IMPORT_DELETE_BUNDLES` | `false` | `true` deletes each bundle from the store once imported; a re-trigger removes one an earlier run left |
 | When deleting from `gitlab` | `PACKAGE_TOKEN` | job token | Project access token, role Maintainer, scope `api`; GitLab refuses the job token a delete |
 | Optional | `IMPORT_INBOX_DIR` | none | Import hand-carried bundles from a directory instead of `IMPORT_STORE` |
+| Optional | `IMPORT_GAP_GRACE` | `6` | Hours a bundle that arrived early waits for an earlier one. Meanwhile the job ends with a warning; after it, it fails with the resend instruction |
+| Optional | `IMPORT_PATH_REWRITE`, `PROMOTE_PATH_REWRITE` | none | `old=new` prefix pairs, comma-separated, applied to each repository path on import (into dev) or on promote (into prod), e.g. `team=company-dev` puts `team/prom/prometheus` at `company-dev/prom/prometheus`. The longest matching prefix wins; every push logs the path it was sent as |
 
 Give NiFi a project access token (Developer, scope `api`) and let Developers merge to the default branch: GitLab runs a pipeline on a protected branch only for a role that may merge to it. With S3, expire `registry-mirror-bundles/` by lifecycle rule if you like, never `registry-mirror-receipt/`.
 
 You know it works when the `import` log shows `pushed to target registry: <host>/team/prometheus:v3.13.4@sha256:...` and `imported: mirror-<stream>-<n>.tar (... digests verified)`. Pull that exact reference to confirm.
+
+### Large images and NiFi sizing
+
+No file larger than `MIRROR_BUNDLE_MAX_SIZE` leaves the low side, so a 10 GB model image crosses as parts. Measured with a 10.2 GB image and 1 GiB parts: the low runner peaked at the image plus one part (10.5 GiB), and the import job at the unpacked image (9.7 GiB), since parts are read straight into the unpacked folder and deleted as they go. Plan each runner's disk at the size of the largest image plus one part.
+
+NiFi copies a file at several steps (the low side's ListenHTTP and PackageFlowFile; the high side's FetchFile and UnpackContent), and by default keeps processed content in its archive until the content repository's disk is 90% full (`nifi.content.repository.archive.max.usage.percentage`). Give the content repository its own disk with room for several parts, or lower that percentage. When a NiFi queue reaches its back-pressure limit (1 GB by default), ListenHTTP answers 503 and sync retries with backoff.
 
 ### Promote dev to prod
 
