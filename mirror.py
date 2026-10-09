@@ -20,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -915,6 +915,8 @@ def sync(path, full=False, out=None, low_only=False):
                 if raw_digest(destination, "TARGET_REGISTRY") != transfer:
                     raise MirrorError(f"low mirror digest mismatch: {image['target']}:{tag}")
                 print(f"pushed to target registry: {low}/{image['target']}:{tag}@{transfer}")
+            if low_only:  # what reached TARGET_REGISTRY, for pending --synced
+                state.setdefault("synced", {})[key] = sent
             names = f"{image['target']}:{', :'.join(tags)}"
             due = full or state["sent"].get(key) != sent or aliases != tags[1:]
             if due:
@@ -1746,14 +1748,194 @@ def promote(record):
     print(f"promoted {len(images)} image tag(s) from {dev} to {prod}, digests verified")
 
 
-def pending(path):
-    """Catalog entries the ledger has not sent at their current digest and platform: what sync sends next."""
+EXPORT_INDEX = "export.json"
+REFERENCE = re.compile(rf"(?:(?P<host>{HOST})/)?(?P<repo>[a-z0-9._/-]+?)(?::(?P<tag>{TAG}))?")
+
+
+def export_tags(entry):
+    """registry/repo:tag, repo:tag or repo (every tag) -> [(host, repo, tag)]. No host: TARGET_REGISTRY."""
+    match = REFERENCE.fullmatch(entry.strip())
+    if not match or not TARGET.fullmatch(match["repo"]):
+        raise MirrorError(f"expected [registry/]repo[/path][:tag], not {entry!r}")
+    host = match["host"] or registry("TARGET_REGISTRY")
+    if match["tag"]:
+        return [(host, match["repo"], match["tag"])]
+    listed = json.loads(run("skopeo", "list-tags", *options(side_of(host)), f"docker://{host}/{match['repo']}"))
+    return [(host, match["repo"], tag) for tag in sorted(listed.get("Tags") or [])]
+
+
+def share_blobs(layout, seen):
+    """Hardlink a blob already stored for an earlier image, so a shared layer is on disk and in the tar once."""
+    for path in sorted(layout.glob("*/*")):
+        if not re.fullmatch(r"[0-9a-f]{64}", path.name):
+            continue
+        first = seen.setdefault(path.name, path)
+        if first != path and not path.samefile(first):
+            link = path.with_name(path.name + ".link")
+            try:
+                os.link(first, link)
+            except OSError:  # a filesystem without hardlinks (exFAT, some shares) keeps both copies
+                continue
+            os.replace(link, path)
+
+
+def export(path, entries, out, tar=None, listing=None):
+    """Copy images into a directory for hand-carry, one dir: copy per image, bytes and digests unchanged.
+
+    Reads registries only: run sync first. Nothing is recorded, so an export never touches the ledger.
+    dir: keeps a Docker manifest list as it is, where an OCI layout would have to convert it. A layer
+    shared by several images is hardlinked, so it is stored once. load pushes the export on the far side.
+    """
+    entries = list(entries)
+    if listing:
+        entries += [line.split("#", 1)[0].strip() for line in Path(listing).read_text().splitlines()]
+        entries = [entry for entry in entries if entry]
+    if entries:
+        wanted = [found for entry in entries for found in export_tags(entry)]
+    else:
+        low = registry("TARGET_REGISTRY")
+        wanted = [(low, image["target"], image["tag"]) for image in catalog(path)]
+    if not wanted:
+        raise MirrorError("nothing to export")
+    layout = Path(out)
+    if layout.exists() and any(layout.iterdir()):
+        raise MirrorError(f"{layout} is not empty; choose an empty directory")
+    layout.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TMPDIR", str(layout.parent))  # skopeo staging on the same disk, outside the export
+    images, seen = [], {}
+    for number, (host, repository, tag) in enumerate(dict.fromkeys(wanted), 1):
+        side = side_of(host)
+        digest = raw_digest(f"docker://{host}/{repository}:{tag}", side)
+        name = f"{number:06d}"
+        copy(f"docker://{host}/{repository}@{digest}", f"dir:{layout / name}", side)
+        if "sha256:" + sha256(layout / name / "manifest.json") != digest:
+            raise MirrorError(f"digest changed in export: {host}/{repository}:{tag}")
+        share_blobs(layout, seen)
+        images.append({"dir": name, "source": f"{host}/{repository}:{tag}", "target": repository, "tag": tag,
+                       "digest": digest})
+        print(f"exported: {host}/{repository}:{tag}@{digest}")
+    write_json(layout / EXPORT_INDEX, {"created": datetime.now(timezone.utc).isoformat(), "images": images})
+    if tar:
+        tar = Path(tar)
+        with tarfile.open(tar.with_name(tar.name + ".tmp"), "w") as stream:  # layers are compressed already
+            stream.add(layout, arcname=".")
+        os.replace(tar.with_name(tar.name + ".tmp"), tar)
+        sidecar = tar.with_name(tar.name + ".sha256")
+        sidecar.with_name(sidecar.name + ".tmp").write_text(f"{sha256(tar)}  {tar.name}\n")
+        os.replace(sidecar.with_name(sidecar.name + ".tmp"), sidecar)
+        print(f"wrote {tar} and {tar.name}.sha256")
+    print(f"exported {len(images)} image tag(s) to {layout}")
+
+
+def carry(path, target, full=False):
+    """sync --low-only, then export what has not been carried yet as one tar into target, for NiFi.
+
+    The tar is built in target/.staging and renamed into target, then its .sha256: a lister of target
+    never sees half a file. The ledger records an image as carried only once both are in place, so a
+    run that fails anywhere carries it again next time. full: every catalog image.
+    """
+    target = Path(target)
+    staging = target / ".staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    if os.stat(staging).st_dev != os.stat(target).st_dev:
+        raise MirrorError(f"{staging} is on another filesystem than {target}, so the move would not be atomic")
+    sync(path, low_only=True)
     platform = os.environ.get("MIRROR_PLATFORM", "").strip()
-    state = load_state(Path(os.devnull)) if ledger_enabled() else None
-    sent = (state or {}).get("sent", {})
+    work = state_path("MIRROR_STATE_DIR", "registry-mirror")
+    state_file = work / "sent.json"
+    state = load_state(state_file) or {}
+    carried = state.get("carried", {})
+    due = [image for image in catalog(path)
+           if full or carried.get(f"{image['target']}:{image['tag']}") != f"{image['digest']} {platform}".strip()]
+    if not due:
+        print("nothing new to carry")
+        return None
+    name = f"mirror-export-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{os.environ.get('CI_PIPELINE_ID', 'local')}"
+    tar, published = staging / f"{name}.tar", []
+    try:
+        export(path, [f"{image['target']}:{image['tag']}" for image in due], staging / name, tar)
+        for built in (tar, tar.with_name(tar.name + ".sha256")):  # the .sha256 last
+            os.replace(built, target / built.name)
+            published.append(target / built.name)
+    finally:
+        shutil.rmtree(staging / name, ignore_errors=True)
+        for leftover in staging.glob(f"{name}.tar*"):
+            leftover.unlink()
+        if len(published) == 1:  # a tar without its .sha256 would never be loaded: take it back
+            published[0].unlink()
+    with locked(work):
+        state = load_state(state_file) or state
+        state.setdefault("carried", {}).update(
+            {f"{image['target']}:{image['tag']}": f"{image['digest']} {platform}".strip() for image in due})
+        save_state(state_file, state)
+    print(f"carried: {target / tar.name} ({len(due)} image tag(s))")
+    return target / tar.name
+
+
+def load(source, force=False):
+    """Push an export (its directory, or the .tar with its .sha256 beside it) into TARGET_REGISTRY."""
+    high = registry("TARGET_REGISTRY")
+    source = Path(source)
+    if not source.is_dir():
+        sidecar = source.with_name(source.name + ".sha256")
+        if not sidecar.exists():
+            raise MirrorError(f"{sidecar.name} is missing; it must travel with {source.name}")
+        if (sidecar.read_text().split() or [""])[0] != sha256(source):
+            raise MirrorError(f"{source.name} does not match {sidecar.name}")
+    # A tar unpacks beside it, or into --state-dir: never the home directory.
+    scratch = Path(os.environ.get("IMPORT_STATE_DIR") or source.parent)
+    scratch.mkdir(parents=True, exist_ok=True)
+    with nullcontext() if source.is_dir() else tempfile.TemporaryDirectory(dir=scratch) as temporary:
+        layout = source
+        if not source.is_dir():
+            layout = Path(temporary)
+            if not hasattr(tarfile, "data_filter"):
+                raise MirrorError("load needs Python 3.12, or 3.8.17 to 3.11.4 or later, for safe tar extraction")
+            with tarfile.open(source, "r:") as stream:  # uncompressed only: the tar's size bounds what unpacks
+                stream.extractall(layout, filter="data")
+        index = json.loads((layout / EXPORT_INDEX).read_text())
+        if not isinstance(index, dict) or not isinstance(index.get("images"), list):
+            raise MirrorError(f"invalid {EXPORT_INDEX}")
+        plan = []
+        for image in index["images"]:  # every image is checked before the first push: a refusal pushes nothing
+            if (not isinstance(image, dict) or not re.fullmatch(r"[0-9]{6}", str(image.get("dir")))
+                    or not TARGET.fullmatch(str(image.get("target"))) or not re.fullmatch(TAG, str(image.get("tag")))
+                    or not re.fullmatch(DIGEST, str(image.get("digest")))):
+                raise MirrorError(f"invalid entry in {EXPORT_INDEX}: {image!r}")
+            directory = layout / image["dir"]
+            if "sha256:" + sha256(directory / "manifest.json") != image["digest"]:
+                raise MirrorError(f"{image['target']}:{image['tag']} does not match its recorded digest")
+            destination = f"docker://{high}/{image['target']}:{image['tag']}"
+            try:
+                present = raw_digest(destination, "TARGET_REGISTRY")
+            except MirrorError as error:
+                if not re.search(r"manifest unknown|name unknown", str(error), re.I):
+                    raise  # a login, TLS or network fault is not proof the tag is absent
+                present = None
+            if present and present != image["digest"] and not force:
+                raise MirrorError(f"{high}/{image['target']}:{image['tag']} is {present}, the export has "
+                                  f"{image['digest']}; a tag does not move without load --force")
+            plan.append((image, directory, destination, present))
+        for image, directory, destination, present in plan:
+            if present == image["digest"]:
+                print(f"already loaded: {high}/{image['target']}:{image['tag']}@{present}")
+                continue
+            copy(f"dir:{directory}", destination, None, "TARGET_REGISTRY")
+            if raw_digest(destination, "TARGET_REGISTRY") != image["digest"]:
+                raise MirrorError(f"digest mismatch in TARGET_REGISTRY after the push: {image['target']}:{image['tag']}")
+            print(f"loaded: {high}/{image['target']}:{image['tag']}@{image['digest']}")
+    print(f"loaded {len(index['images'])} image tag(s) into {high}, digests verified")
+
+
+def pending(path, synced=False, targets=False, carried=False):
+    """Catalog entries the ledger has not sent at their current digest and platform: what sync sends next.
+    synced: not yet in TARGET_REGISTRY instead, for a pipeline that runs sync --low-only (MIRROR_SEND=none)."""
+    platform = os.environ.get("MIRROR_PLATFORM", "").strip()
+    state = load_state(state_path("MIRROR_STATE_DIR", "registry-mirror") / "sent.json")
+    sent = (state or {}).get("carried" if carried else "synced" if synced else "sent", {})
     for image in catalog(path):
         if sent.get(f"{image['target']}:{image['tag']}") != f"{image['digest']} {platform}".strip():
-            print(image["source"])
+            print(f"{image['target']}:{image['tag']}" if targets else image["source"])
 
 
 def references(files):
@@ -1819,6 +2001,16 @@ RENAMED = {
 }
 
 
+def send_arguments(where, path, bucket):
+    """[method] [outbox]: the method may be left out when --path (dir) or --bucket (s3) says which."""
+    where = list(where)
+    method = where.pop(0) if where and where[0] in ("nifi", "dir", "s3") else \
+        "dir" if path else "s3" if bucket else "nifi"
+    if len(where) > 1:
+        raise MirrorError(f"send takes [method] [outbox], not {' '.join(where)}")
+    return method, (where[0] if where else None)
+
+
 def check_renamed():
     stale = sorted(f"{old} is now {new}" for old, new in RENAMED.items() if os.environ.get(old))
     if stale:
@@ -1854,11 +2046,13 @@ Low side (pull from the source, save to your registry, send bundles):
   mirror.py send s3 --bucket transfer --prefix mirror outbox   # .ffv3 objects for ListS3 (S3_* env)
   mirror.py send dir --path /media/usb --format tar outbox     # hand-carry to import --inbox
   mirror.py resend --sequence 7..     # the high side reported bundle 7 missing
+  mirror.py export --out /share/export --tar /share/export.tar   # hand-carry what TARGET_REGISTRY holds
 
 High side (receive bundles, push to your registry, promote dev to prod):
   TARGET_REGISTRY=registry.high.example.com mirror.py login
   mirror.py import --registry --name mirror-<stream>-000000000008.tar --record imported.json
   mirror.py import --inbox /transfer/in
+  mirror.py load /media/usb/export.tar   # an export: push it, tags and digests unchanged
   SOURCE_REGISTRY=registry.dev.example.com TARGET_REGISTRY=registry.prod.example.com mirror.py promote imported.json
 
 Run "mirror.py <command> -h" for each command's options and examples.
@@ -1869,6 +2063,9 @@ def main(argv=None):
     raw = argparse.RawDescriptionHelpFormatter
     parser = argparse.ArgumentParser(description=__doc__, epilog=EXAMPLES, formatter_class=raw)
     parser.add_argument("--catalog", type=Path, default=ROOT / "images.txt", help="image catalog (default images.txt)")
+    parser.add_argument("--state-dir", type=Path,
+                        help="work, staging and outbox directory, e.g. on a large disk (or MIRROR_STATE_DIR, "
+                             "IMPORT_STATE_DIR; default ~/.local/state)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print every skopeo and curl command and each image decision (or MIRROR_VERBOSE=true)")
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
@@ -1901,10 +2098,12 @@ def main(argv=None):
                            "  mirror.py send nifi outbox                        # POST to NIFI_URL\n"
                            "  mirror.py send nifi --url https://nifi:9443/contentListener outbox\n"
                            "  mirror.py send dir --path /mnt/transfer outbox    # .ffv3 for a low NiFi ListFile\n"
+                           "  mirror.py send --path /mnt/transfer outbox        # the same: --path means dir\n"
                            "  mirror.py send s3 --bucket transfer outbox        # .ffv3 objects; S3_ENDPOINT, AWS_* keys\n"
                            "  mirror.py send dir --path /media/usb --format tar outbox   # hand-carry")
-    send_command.add_argument("method", choices=("nifi", "dir", "s3"))
-    send_command.add_argument("outbox", nargs="?", help="default MIRROR_BUNDLE_DIR, else outbox/ in MIRROR_STATE_DIR")
+    send_command.add_argument("where", nargs="*", metavar="[method] [outbox]",
+                              help="method nifi, dir or s3; left out, --path means dir, --bucket s3, else nifi. "
+                                   "outbox: default MIRROR_BUNDLE_DIR, else outbox/ in MIRROR_STATE_DIR")
     send_command.add_argument("--url", default=os.environ.get("NIFI_URL"), help="nifi: ListenHTTP URL (default NIFI_URL)")
     send_command.add_argument("--path", help="dir: the directory to write into")
     send_command.add_argument("--format", choices=("ffv3", "tar"), default="ffv3",
@@ -1929,7 +2128,11 @@ def main(argv=None):
         "  is read as docker pull reads it (alpine -> docker.io/library/alpine); without a tag, :latest.")
     add_list_command.add_argument("folder", type=Path, help="a directory of *.txt files")
     add_list_command.add_argument("--prefix", help="repository path the targets go under, e.g. team")
-    command("pending", "list catalog sources the ledger has not sent yet, one per line", "  mirror.py pending")
+    pending_command = command("pending", "list catalog sources the ledger has not sent yet, one per line",
+                              "  mirror.py pending\n  mirror.py pending --synced   # not yet in TARGET_REGISTRY (sync --low-only)")
+    pending_command.add_argument("--synced", action="store_true", help="what sync --low-only has not yet copied")
+    pending_command.add_argument("--targets", action="store_true", help="print repo:tag in TARGET_REGISTRY, for export --list")
+    pending_command.add_argument("--carried", action="store_true", help="what carry has not yet exported")
     check = command("covers", "fail when a Containerfile or manifest uses an image the mirror lacks",
                     "  mirror.py covers Containerfile\n  helm template chart/ | mirror.py covers -")
     check.add_argument("files", nargs="+", help="Containerfiles, manifests or - for rendered YAML on stdin")
@@ -1946,13 +2149,42 @@ def main(argv=None):
     high.add_argument("--name", help="with --registry: the bundle file a trigger announced (BUNDLE)")
     high.add_argument("--adopt-stream", action="store_true", help="accept a full bundle from a replacement sender")
     high.add_argument("--record", type=Path, help="write the image tags and digests this run pushed, for promote")
+    export_command = command(
+        "export", "copy images from a registry into one directory or tar to hand-carry (no sync, no ledger)",
+        "  mirror.py export --out /share/export                      # every catalog image\n"
+        "  mirror.py export --out /share/export --tar /share/export.tar   # plus one tar and its .sha256\n"
+        "  mirror.py export --out /share/export team/prometheus:v3.13.4 team/grafana   # a tag, every tag\n"
+        "  mirror.py export --out /share/export quay.low.example.com/team/app:v1.2.3   # any registry, full reference\n"
+        "  mirror.py export --out /share/export --list images-to-carry.txt             # one reference per line")
+    export_command.add_argument("images", nargs="*",
+                                help="registry/repo:tag, or repo:tag in TARGET_REGISTRY; no tag: every tag. Default the catalog")
+    export_command.add_argument("--list", type=Path, help="a file of image references, one per line, # comments")
+    export_command.add_argument("--out", required=True, type=Path, help="an empty directory for the export")
+    export_command.add_argument("--tar", type=Path, help="also write the layout as this tar, with a .sha256 beside it")
+    carry_command = command("carry", "sync --low-only, then export what is new as one tar into a directory NiFi lists",
+                            "  mirror.py carry --path /mnt/transfer         # the tar appears whole, its .sha256 last\n"
+                            "  mirror.py carry --path /mnt/transfer --all   # every catalog image")
+    carry_command.add_argument("--path", required=True, type=Path, help="the directory NiFi lists (tar built in .staging)")
+    carry_command.add_argument("--all", action="store_true", help="carry every catalog image, not only new ones")
+    load_command = command("load", "push an export into TARGET_REGISTRY, tags and digests unchanged",
+                           "  mirror.py load /media/usb/export.tar   # checked against export.tar.sha256\n"
+                           "  mirror.py load /share/export           # the layout directory itself")
+    load_command.add_argument("source", type=Path, help="an export directory, or its .tar")
+    load_command.add_argument("--force", action="store_true", help="move a tag that already points at another digest")
     promote_command = command("promote", "copy recorded images from SOURCE_REGISTRY (dev) to TARGET_REGISTRY (prod) by digest",
                               "  SOURCE_REGISTRY=registry.dev.example.com TARGET_REGISTRY=registry.prod.example.com \\\n"
                               "    mirror.py promote imported.json      # the file import --record wrote")
     promote_command.add_argument("record", type=Path, help="the file import --record wrote")
-    args = parser.parse_args(argv)
+    args, extra = parser.parse_known_args(argv)
+    if extra and (args.command != "send" or any(e.startswith("-") for e in extra)):
+        parser.error("unrecognized arguments: " + " ".join(extra))
+    if extra:  # send dir --path X outbox: the outbox after the options
+        args.where += extra
     if args.verbose:
         os.environ["MIRROR_VERBOSE"] = "true"
+    if args.state_dir:  # a flag wins over the environment
+        os.environ["MIRROR_STATE_DIR"] = os.environ["IMPORT_STATE_DIR"] = str(args.state_dir)
+        os.environ["TMPDIR"] = str(args.state_dir)
     try:
         check_renamed()
         if args.command == "login":
@@ -1971,15 +2203,22 @@ def main(argv=None):
                                    ("region", "S3_REGION")):
                 if getattr(args, flag) is not None:  # a flag wins over its environment default
                     os.environ[variable] = getattr(args, flag)
-            send(args.method, args.outbox, args.url if args.method == "nifi" else args.path, args.format)
+            method, outbox_dir = send_arguments(args.where, args.path, args.bucket)
+            send(method, outbox_dir, args.url if method == "nifi" else args.path, args.format)
         elif args.command == "resend":
             resend(args.since, args.sequence, args.image, args.out)
         elif args.command == "add-list":
             add_list(args.catalog, args.folder, args.prefix)
         elif args.command == "pending":
-            pending(args.catalog)
+            pending(args.catalog, args.synced, args.targets, args.carried)
         elif args.command == "covers":
             covers(args.catalog, args.files)
+        elif args.command == "export":
+            export(args.catalog, args.images, args.out, args.tar, args.list)
+        elif args.command == "carry":
+            carry(args.catalog, args.path, args.all)
+        elif args.command == "load":
+            load(args.source, args.force)
         elif args.command == "promote":
             promote(args.record)
         else:

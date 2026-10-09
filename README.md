@@ -18,7 +18,7 @@ Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` 
 |---|---|---|---|
 | Required | `TARGET_REGISTRY` | none | Low registry, `host[:port]` |
 | Required | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account that can push; leave unset for a registry without auth |
-| Required | `MIRROR_SEND` | `nifi` | How bundles leave: `nifi`, `dir` or `s3`. See [Send](#send) |
+| Required | `MIRROR_SEND` | `none` | How images leave: `none` (sync `TARGET_REGISTRY` only; carry with [Export and load](#export-and-load) by hand), `export` (sync, then export what the run added as one tar into `MIRROR_SEND_PATH`), or bundles by `nifi`, `dir` or `s3`. See [Send](#send) |
 | `MIRROR_SEND=nifi` | `NIFI_URL` | none | NiFi ListenHTTP the bundles are posted to |
 | `MIRROR_SEND=dir` | `MIRROR_SEND_PATH` | none | Directory the low NiFi lists, e.g. an NFS share at `/mnt/transfer` mounted on the runner |
 | `MIRROR_SEND=s3` | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; optional `S3_PREFIX`, `S3_REGION`, `S3_CA_BUNDLE`, `S3_TLS_VERIFY` | none | The low-side bucket the low NiFi lists |
@@ -67,6 +67,7 @@ up as a gap on the high side, recovered with a resend.
 python3 mirror.py sync --out outbox
 python3 mirror.py send nifi --url https://nifi.low:9443/contentListener outbox   # default NIFI_URL
 python3 mirror.py send dir --path /mnt/transfer outbox                             # NFS share for NiFi
+python3 mirror.py send --path /mnt/transfer outbox                                 # the same: --path implies dir
 python3 mirror.py send s3 --bucket transfer --prefix mirror outbox                 # S3_* and AWS_* env
 python3 mirror.py send dir --path /media/usb --format tar outbox                   # hand-carry
 ```
@@ -114,6 +115,31 @@ place, and checks every file against its digest as before.
   Run pipeline on the low side with `RESEND_ALL=true`.
 - `IMPORT_PATH_REWRITE` applies to those reads too. An importer from before this release refuses
   a schema 2 bundle rather than pushing an incomplete image: upgrade the high side first.
+
+### Export and load
+
+For hand-carry, `export` copies images that are already in a registry into one directory, and optionally one tar with a `.sha256`. It does not sync, pull from upstream or touch the ledger, so it runs as fast as the registry and disk allow: sync first (`MIRROR_SEND=none` in the pipeline), export when you need a carry. Each image is a byte-for-byte `dir:` copy, so tags, digests and Docker manifest lists or OCI indexes are kept, and a layer shared by several images is hardlinked and stored once.
+
+```sh
+TARGET_REGISTRY=quay.low.example.com mirror.py export --out /share/export --tar /share/export.tar   # the catalog
+mirror.py export --out /share/export team/prometheus:v3.13.4 team/grafana       # in TARGET_REGISTRY: a tag, every tag
+mirror.py export --out /share/export quay.low.example.com/team/app:v1.2.3       # any registry, full reference
+mirror.py export --out /share/export --tar /share/carry.tar --list carry.txt    # a batch: one reference per line
+```
+
+On the high side, `load` checks the tar against its `.sha256`, pushes every image to the same path in `TARGET_REGISTRY` and verifies each digest there. An image already present at its digest is skipped, so a rerun is cheap. A tag that points at a different digest is refused unless you pass `--force`.
+
+```sh
+TARGET_REGISTRY=quay.high.example.com mirror.py load /media/usb/export.tar
+```
+
+With `MIRROR_SEND=export` the pipeline runs `mirror.py carry --path "$MIRROR_SEND_PATH"`: it syncs `TARGET_REGISTRY`, exports the catalog images not carried yet (every one with `RESEND_ALL=true`) as `mirror-export-<UTC time>-<pipeline>.tar` in `MIRROR_SEND_PATH/.staging`, then renames the tar and, last, its `.sha256` into `MIRROR_SEND_PATH`. `.staging` must be on the same filesystem, or carry refuses to start. The ledger records an image as carried only after both files are in place, so a failed run carries it again next time, and a failed run leaves nothing behind in `.staging`. A NiFi `ListFile` on that path therefore never sees half a file; set its **Recurse Subdirectories** to `false` so it does not list `.staging`. On the high side the tar lands wherever NiFi puts it, and `load` is run by hand.
+
+An export is not a bundle: `import` does not read it, and it carries no sequence or ledger state. The `.sha256` catches corruption in transit, not deliberate tampering, the same trust as any hand-carried media.
+
+A registry that is neither `TARGET_REGISTRY` nor `SOURCE_REGISTRY` is read with TLS verified and the system trust store.
+
+`--state-dir DIR` (any command) moves the work directory, staging and default outbox off `~/.local/state`, for a host whose home disk is small. `load` unpacks a tar into it, else beside the tar.
 
 ## High side: receive, load, push
 

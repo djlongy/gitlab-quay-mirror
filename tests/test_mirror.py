@@ -982,6 +982,88 @@ class LedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(mirror.MirrorError, "IMPORT_DELETE_BUNDLES must be true or false, not 'yes'"):
             mirror.import_registry(f'{stem}.tar')
 
+    def test_send_infers_the_method_from_its_flags(self):
+        self.assertEqual(mirror.send_arguments(['outbox'], '/mnt/transfer', None), ('dir', 'outbox'))
+        self.assertEqual(mirror.send_arguments(['dir', 'outbox'], '/mnt/transfer', None), ('dir', 'outbox'))
+        self.assertEqual(mirror.send_arguments([], None, 'transfer'), ('s3', None))
+        self.assertEqual(mirror.send_arguments(['outbox'], None, None), ('nifi', 'outbox'))
+        with self.assertRaises(mirror.MirrorError):
+            mirror.send_arguments(['outbox', 'extra'], '/mnt/transfer', None)
+
+    def test_send_takes_the_outbox_before_or_after_its_options(self):
+        with mock.patch.object(mirror, 'send', return_value=0) as send:
+            for argv in (['send', 'dir', '--path', '/m', 'ob'], ['send', '--path', '/m', 'ob'], ['send', 'dir', 'ob', '--path', '/m']):
+                self.assertEqual(mirror.main(argv), 0)
+                send.assert_called_with('dir', 'ob', '/m', 'ffv3')
+        with self.assertRaises(SystemExit):
+            mirror.main(['targets', 'extra'])
+
+    def test_share_blobs_hardlinks_a_repeated_blob_and_keeps_it_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout, blob = Path(directory), 'a' * 64
+            for image in ('000001', '000002'):
+                (layout / image).mkdir()
+                (layout / image / blob).write_bytes(b'layer')
+            mirror.share_blobs(layout, {})
+            self.assertTrue((layout / '000001' / blob).samefile(layout / '000002' / blob))
+            self.assertEqual((layout / '000002' / blob).read_bytes(), b'layer')
+            with mock.patch.object(mirror.os, 'link', side_effect=OSError('no hardlinks')):
+                (layout / '000003').mkdir()
+                (layout / '000003' / blob).write_bytes(b'layer')
+                mirror.share_blobs(layout, {})
+            self.assertEqual((layout / '000003' / blob).read_bytes(), b'layer')
+
+    def test_carry_records_nothing_when_the_export_fails(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {'MIRROR_STATE_DIR': f'{directory}/work', 'MIRROR_LEDGER': 'false'}):
+            catalog = Path(directory) / 'images.txt'
+            catalog.write_text('docker.io/library/alpine:3.20@sha256:' + 'b' * 64 + ' mirror/alpine\n')
+            target = Path(directory) / 'transfer'
+            with mock.patch.object(mirror, 'sync'), \
+                    mock.patch.object(mirror, 'export', side_effect=mirror.MirrorError('registry down')):
+                with self.assertRaises(mirror.MirrorError):
+                    mirror.carry(catalog, target)
+            self.assertEqual(sorted(p.name for p in target.iterdir()), ['.staging'])
+            self.assertEqual(list((target / '.staging').iterdir()), [])
+            with mock.patch('sys.stdout', new_callable=io.StringIO) as out:
+                mirror.pending(catalog, carried=True, targets=True)
+            self.assertEqual(out.getvalue(), 'mirror/alpine:3.20\n')  # still due next run
+
+    def test_load_will_not_move_a_tag_without_force(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
+            image = Path(directory) / '000001'
+            image.mkdir()
+            (image / 'manifest.json').write_bytes(b'{}')
+            digest = 'sha256:' + hashlib.sha256(b'{}').hexdigest()
+            Path(directory, mirror.EXPORT_INDEX).write_text(json.dumps(
+                {'images': [{'dir': '000001', 'target': 'team/app', 'tag': 'v1', 'digest': digest}]}))
+            with mock.patch.object(mirror, 'raw_digest', return_value='sha256:' + 'a' * 64), \
+                    mock.patch.object(mirror, 'copy') as copy:
+                with self.assertRaisesRegex(mirror.MirrorError, 'does not move without load --force'):
+                    mirror.load(Path(directory))
+                copy.assert_not_called()
+            with mock.patch.object(mirror, 'raw_digest', side_effect=mirror.MirrorError('skopeo inspect failed: unauthorized')), \
+                    mock.patch.object(mirror, 'copy') as copy:
+                with self.assertRaisesRegex(mirror.MirrorError, 'unauthorized'):  # not read as an absent tag
+                    mirror.load(Path(directory))
+                copy.assert_not_called()
+
+    def test_load_refuses_a_tar_whose_checksum_does_not_match(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
+            bundle = Path(directory) / 'export.tar'
+            bundle.write_bytes(b'not the exported bytes')
+            with self.assertRaisesRegex(mirror.MirrorError, 'sha256 is missing'):
+                mirror.load(bundle)
+            bundle.with_name('export.tar.sha256').write_text('0' * 64 + '  export.tar\n')
+            with self.assertRaisesRegex(mirror.MirrorError, 'does not match'):
+                mirror.load(bundle)
+
+    def test_export_refuses_a_directory_that_is_not_empty(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
+            Path(directory, mirror.EXPORT_INDEX).write_text('{}')
+            with self.assertRaisesRegex(mirror.MirrorError, 'is not empty'):
+                mirror.export(Path(os.devnull), ['team/app:v1'], directory)
+
     def test_send_delivers_each_file_once_and_clears_the_pending_ledger(self):
         files = self.store()
         path, _, fake_copy, fake_digest = self.latest_entry()
