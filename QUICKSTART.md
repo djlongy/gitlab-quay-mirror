@@ -8,7 +8,7 @@
 | `export` | syncs, then writes the new images as one `.tar` and `.sha256` into `MIRROR_SEND_PATH` (built in `MIRROR_STAGING_PATH`, default `MIRROR_SEND_PATH/.staging`) | NiFi carries the tar; you run `mirror.py load <tar>` |
 | `nifi`, `dir`, `s3` | syncs and sends sequenced bundles | the high pipeline (`.gitlab-ci-high.yml`) imports them |
 
-Any OCI registry works on either side. It does not approve updates or deploy anything. sync, send, carry, export and load print the directories they write to before they start, and each has a flag (`--state-dir`, `--staging`, `--out`, `--tar`, `--tmp`, `--scratch`).
+Any OCI registry works on either side. It does not approve updates or deploy anything. sync, send, carry, export and load print the directories they write to before they start, and each has a flag (`--state-dir`, `--tar`, `--staging`, `--out`, `--tmp`, `--scratch`). Only the pipeline dedupes; a manual export is fresh every time.
 
 ## How to use it
 
@@ -23,8 +23,8 @@ By hand, on any host with skopeo (the low side, then the high side):
 ```sh
 export TARGET_REGISTRY=quay.low.example.com
 python3 mirror.py --state-dir /share/mirror sync --low-only           # export reads the low registry: sync first
-python3 mirror.py --state-dir /share/mirror \
-  export --out /share/carry --tar /share/carry.tar --list carry.txt     # carry.txt: one image reference per line
+python3 mirror.py export --tar /share/carry.tar --staging /share/tmp --list carry.txt   # one reference per line
+# one image the high side is missing: python3 mirror.py export --tar /share/fix.tar team/app:v1.2.3
 # carry carry.tar and carry.tar.sha256 together; load refuses a tar without its .sha256
 TARGET_REGISTRY=quay.high.example.com python3 mirror.py load /media/usb/carry.tar --scratch /share/unpack
 ```

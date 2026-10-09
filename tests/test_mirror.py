@@ -1042,6 +1042,19 @@ class LedgerTest(unittest.TestCase):
                 pass
             self.assertNotIn('TMPDIR', os.environ)
 
+    def test_export_needs_a_destination_and_cleans_its_working_directory(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
+            with self.assertRaisesRegex(mirror.MirrorError, 'say where the export goes'):
+                mirror.export(Path(os.devnull), ['team/app:v1'])
+            with self.assertRaisesRegex(mirror.MirrorError, 'takes no --tar or --staging'):
+                mirror.export(Path(os.devnull), ['team/app:v1'], out=directory, tar=Path(directory) / 'x.tar')
+            tar = Path(directory) / 'out' / 'carry.tar'
+            with mock.patch.object(mirror, 'raw_digest', return_value='sha256:' + 'a' * 64), \
+                    mock.patch.object(mirror, 'copy', side_effect=mirror.MirrorError('registry down')):
+                with self.assertRaisesRegex(mirror.MirrorError, 'registry down'):
+                    mirror.export(Path(os.devnull), ['team/app:v1'], tar=tar, staging=directory)
+            self.assertEqual([p.name for p in Path(directory).iterdir()], [])  # no working directory, no tar
+
     def test_load_will_not_move_a_tag_without_force(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
             image = Path(directory) / '000001'

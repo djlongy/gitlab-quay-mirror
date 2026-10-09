@@ -1801,8 +1801,10 @@ def share_blobs(layout, seen):
             os.replace(link, path)
 
 
-def export(path, entries, out, tar=None, listing=None, tmp=None):
-    """Copy images into a directory for hand-carry, one dir: copy per image, bytes and digests unchanged.
+def export(path, entries, out=None, tar=None, listing=None, tmp=None, staging=None):
+    """Copy images into one tar (and its .sha256) for hand-carry, one dir: copy per image, bytes and digests
+    unchanged. The images are first copied into a working directory in staging (default the current
+    directory), which is removed once the tar is written, or on failure. out instead keeps an unpacked export.
 
     Reads registries only: run sync first. Nothing is recorded, so an export never touches the ledger.
     dir: keeps a Docker manifest list as it is, where an OCI layout would have to convert it. A layer
@@ -1819,38 +1821,57 @@ def export(path, entries, out, tar=None, listing=None, tmp=None):
         wanted = [(low, image["target"], image["tag"]) for image in catalog(path)]
     if not wanted:
         raise MirrorError("nothing to export")
-    layout = Path(out)
+    if not (out or tar):
+        raise MirrorError("say where the export goes: --tar FILE, or --out DIR to keep it unpacked")
+    if out and (tar or staging):
+        raise MirrorError("--out keeps an unpacked export in that directory; it takes no --tar or --staging")
+    working = not out  # a directory only for building the tar, removed afterwards
+    tar = Path(tar) if tar else None
+    layout = Path(out) if out else Path(staging or ".") / f"{tar.name}.export"
     if layout.exists() and any(layout.iterdir()):
         raise MirrorError(f"{layout} is not empty; choose an empty directory")
-    layout.mkdir(parents=True, exist_ok=True)
-    # skopeo's scratch: --tmp, else TMPDIR (--state-dir sets it), else beside the export, never /tmp by surprise.
-    tmp = Path(tmp or os.environ.get("TMPDIR") or layout.parent)
-    tmp.mkdir(parents=True, exist_ok=True)
-    paths(export_directory=layout, **({"export_tar": tar} if tar else {}), skopeo_scratch=tmp)
-    images, seen = [], {}
-    for number, (host, repository, tag) in enumerate(dict.fromkeys(wanted), 1):
-        side = side_of(host)
-        digest = raw_digest(f"docker://{host}/{repository}:{tag}", side)
-        name = f"{number:06d}"
-        with scratch(tmp):
-            copy(f"docker://{host}/{repository}@{digest}", f"dir:{layout / name}", side)
-        if "sha256:" + sha256(layout / name / "manifest.json") != digest:
-            raise MirrorError(f"digest changed in export: {host}/{repository}:{tag}")
-        share_blobs(layout, seen)
-        images.append({"dir": name, "source": f"{host}/{repository}:{tag}", "target": repository, "tag": tag,
-                       "digest": digest})
-        print(f"exported: {host}/{repository}:{tag}@{digest}")
-    write_json(layout / EXPORT_INDEX, {"created": datetime.now(timezone.utc).isoformat(), "images": images})
+    if tar and any(tar.with_name(tar.name + suffix).exists() for suffix in ("", ".sha256", ".tmp", ".sha256.tmp")):
+        raise MirrorError(f"{tar}, its .sha256 or a .tmp of either already exists; choose another name")
+    # skopeo's scratch: --tmp, else --state-dir, else beside the working directory; never the system TMPDIR.
+    tmp = Path(tmp or os.environ.get("MIRROR_SCRATCH") or layout.parent)
+    try:
+        layout.mkdir(parents=True, exist_ok=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        paths(**({"export_tar": tar} if tar else {}),
+              **({"working_directory_removed_after": layout} if working else {"export_directory": layout}),
+              skopeo_scratch=tmp)
+        images, seen = [], {}
+        for number, (host, repository, tag) in enumerate(dict.fromkeys(wanted), 1):
+            side = side_of(host)
+            digest = raw_digest(f"docker://{host}/{repository}:{tag}", side)
+            name = f"{number:06d}"
+            with scratch(tmp):
+                copy(f"docker://{host}/{repository}@{digest}", f"dir:{layout / name}", side)
+            if "sha256:" + sha256(layout / name / "manifest.json") != digest:
+                raise MirrorError(f"digest changed in export: {host}/{repository}:{tag}")
+            share_blobs(layout, seen)
+            images.append({"dir": name, "source": f"{host}/{repository}:{tag}", "target": repository, "tag": tag,
+                           "digest": digest})
+            print(f"exported: {host}/{repository}:{tag}@{digest}")
+        write_json(layout / EXPORT_INDEX, {"created": datetime.now(timezone.utc).isoformat(), "images": images})
+        if tar:
+            tar.parent.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(tar.with_name(tar.name + ".tmp"), "w") as stream:  # layers are compressed already
+                stream.add(layout, arcname=".")
+            os.replace(tar.with_name(tar.name + ".tmp"), tar)
+            sidecar = tar.with_name(tar.name + ".sha256")
+            sidecar.with_name(sidecar.name + ".tmp").write_text(f"{sha256(tar)}  {tar.name}\n")
+            os.replace(sidecar.with_name(sidecar.name + ".tmp"), sidecar)
+    finally:
+        if tar:
+            for partial in (tar.with_name(tar.name + ".tmp"), tar.with_name(tar.name + ".sha256.tmp")):
+                partial.unlink(missing_ok=True)
+        if working:
+            shutil.rmtree(layout, ignore_errors=True)
     if tar:
-        tar = Path(tar)
-        with tarfile.open(tar.with_name(tar.name + ".tmp"), "w") as stream:  # layers are compressed already
-            stream.add(layout, arcname=".")
-        os.replace(tar.with_name(tar.name + ".tmp"), tar)
-        sidecar = tar.with_name(tar.name + ".sha256")
-        sidecar.with_name(sidecar.name + ".tmp").write_text(f"{sha256(tar)}  {tar.name}\n")
-        os.replace(sidecar.with_name(sidecar.name + ".tmp"), sidecar)
-        print(f"wrote {tar} and {tar.name}.sha256")
-    print(f"exported {len(images)} image tag(s) to {layout}")
+        print(f"wrote {tar} and {tar.name}.sha256 ({len(images)} image tag(s))")
+    else:
+        print(f"exported {len(images)} image tag(s) to {layout}")
 
 
 def carry(path, target, full=False, staging=None):
@@ -1881,15 +1902,19 @@ def carry(path, target, full=False, staging=None):
         return None
     name = f"mirror-export-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{os.environ.get('CI_PIPELINE_ID', 'local')}"
     tar, published = staging / f"{name}.tar", []
+    if any((target / f"{name}.tar{suffix}").exists() for suffix in ("", ".sha256")):
+        raise MirrorError(f"{target / name}.tar already exists; run carry again in a second")
     try:
-        export(path, [f"{image['target']}:{image['tag']}" for image in due], staging / name, tar)
+        export(path, [f"{image['target']}:{image['tag']}" for image in due], tar=tar, staging=staging)
         for built in (tar, tar.with_name(tar.name + ".sha256")):  # the .sha256 last
             os.replace(built, target / built.name)
             published.append(target / built.name)
     finally:
-        shutil.rmtree(staging / name, ignore_errors=True)
         for leftover in staging.glob(f"{name}.tar*"):
-            leftover.unlink()
+            if leftover.is_dir():
+                shutil.rmtree(leftover, ignore_errors=True)
+            else:
+                leftover.unlink(missing_ok=True)
         if len(published) == 1:  # a tar without its .sha256 would never be loaded: take it back
             published[0].unlink()
     with locked(work):
@@ -2079,8 +2104,8 @@ Low side (pull from the source, save to your registry, send bundles):
   mirror.py resend --sequence 7..     # the high side reported bundle 7 missing
   mirror.py --state-dir /share/mirror sync --low-only   # update TARGET_REGISTRY only; work files on /share
   mirror.py carry --path /mnt/transfer --staging /mnt/transfer/.staging   # new images as one tar for NiFi
-  mirror.py export --out /share/export --tar /share/export.tar --tmp /share/tmp   # hand-carry (TARGET_REGISTRY)
-  mirror.py export --out /share/export --list carry.txt     # a batch of full references, any registry
+  mirror.py export --tar /share/carry.tar team/app:v1.2.3   # one image to hand-carry, built in . (removed after)
+  mirror.py export --tar /share/carry.tar --staging /share/tmp --list carry.txt   # a batch, any registry
 
 High side (receive bundles, push to your registry, promote dev to prod):
   TARGET_REGISTRY=registry.high.example.com mirror.py login
@@ -2186,17 +2211,20 @@ def main(argv=None):
     high.add_argument("--record", type=Path, help="write the image tags and digests this run pushed, for promote")
     export_command = command(
         "export", "copy images from a registry into one directory or tar to hand-carry (no sync, no ledger)",
-        "  mirror.py export --out /share/export                      # every catalog image\n"
-        "  mirror.py export --out /share/export --tar /share/export.tar   # plus one tar and its .sha256\n"
-        "  mirror.py export --out /share/export team/prometheus:v3.13.4 team/grafana   # a tag, every tag\n"
-        "  mirror.py export --out /share/export quay.low.example.com/team/app:v1.2.3   # any registry, full reference\n"
-        "  mirror.py export --out /share/export --list images-to-carry.txt             # one reference per line")
+        "  mirror.py export --tar /share/carry.tar                   # every catalog image; built in ., removed after\n"
+        "  mirror.py export --tar /share/carry.tar --staging /share/tmp team/prometheus:v3.13.4 team/grafana\n"
+        "                                                            # a tag, every tag; built in /share/tmp\n"
+        "  mirror.py export --tar /share/carry.tar quay.low.example.com/team/app:v1.2.3   # any registry\n"
+        "  mirror.py export --tar /share/carry.tar --list carry.txt  # a batch: one reference per line\n"
+        "  mirror.py export --out /share/export team/app:v1.2.3      # no tar: keep the export unpacked")
     export_command.add_argument("images", nargs="*",
                                 help="registry/repo:tag, or repo:tag in TARGET_REGISTRY; no tag: every tag. Default the catalog")
     export_command.add_argument("--list", type=Path, help="a file of image references, one per line, # comments")
-    export_command.add_argument("--out", required=True, type=Path, help="an empty directory for the export")
-    export_command.add_argument("--tar", type=Path, help="also write the layout as this tar, with a .sha256 beside it")
-    export_command.add_argument("--tmp", type=Path, help="skopeo's scratch (default TMPDIR, else beside --out)")
+    export_command.add_argument("--tar", type=Path, help="the tar to write, with a .sha256 beside it")
+    export_command.add_argument("--staging", type=Path,
+                                help="where the tar is built; the working directory is removed after (default .)")
+    export_command.add_argument("--out", type=Path, help="instead of --tar: an empty directory, kept unpacked")
+    export_command.add_argument("--tmp", type=Path, help="skopeo's scratch (default --state-dir, else --staging, else beside --out)")
     carry_command = command("carry", "sync --low-only, then export what is new as one tar into a directory NiFi lists",
                             "  mirror.py carry --path /mnt/transfer         # the tar appears whole, its .sha256 last\n"
                             "  mirror.py carry --path /mnt/transfer --all   # every catalog image")
@@ -2223,7 +2251,7 @@ def main(argv=None):
         os.environ["MIRROR_VERBOSE"] = "true"
     if args.state_dir:  # a flag wins over the environment
         os.environ["MIRROR_STATE_DIR"] = os.environ["IMPORT_STATE_DIR"] = str(args.state_dir)
-        os.environ["TMPDIR"] = str(args.state_dir)
+        os.environ["TMPDIR"] = os.environ["MIRROR_SCRATCH"] = str(args.state_dir)
     try:
         check_renamed()
         if args.command == "login":
@@ -2253,7 +2281,7 @@ def main(argv=None):
         elif args.command == "covers":
             covers(args.catalog, args.files)
         elif args.command == "export":
-            export(args.catalog, args.images, args.out, args.tar, args.list, args.tmp)
+            export(args.catalog, args.images, args.out, args.tar, args.list, args.tmp, args.staging)
         elif args.command == "carry":
             carry(args.catalog, args.path, args.all, args.staging)
         elif args.command == "load":
