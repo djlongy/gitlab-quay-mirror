@@ -23,10 +23,12 @@ variables:
   RESEND_SINCE: ''
   RESEND_SEQUENCE: ''
   RESEND_IMAGE: ''
-  # How sync's bundles leave: nifi (POST to NIFI_URL), dir (.ffv3 files in MIRROR_SEND_PATH, e.g. an NFS
-  # share mounted on the runner, for a low NiFi ListFile) or s3 (.ffv3 objects in S3_BUCKET at S3_ENDPOINT,
+  # How sync's bundles leave: none (sync TARGET_REGISTRY only, no bundles; carry images with
+  # mirror.py export), export (sync TARGET_REGISTRY, then export what this run added as one tar into
+  # MIRROR_SEND_PATH for NiFi to carry; load it on the high side), nifi (POST to NIFI_URL), dir (.ffv3 files in MIRROR_SEND_PATH, e.g. an NFS share
+  # mounted on the runner, for a low NiFi ListFile) or s3 (.ffv3 objects in S3_BUCKET at S3_ENDPOINT,
   # S3_PREFIX optional, keys in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, for a low NiFi ListS3).
-  MIRROR_SEND: 'nifi'
+  MIRROR_SEND: 'none'
   # true: delta bundles leave out layers the high side already has (README, Blob delta).
   MIRROR_BLOB_DELTA: 'false'
   MIRROR_SEND_PATH: ''
@@ -40,7 +42,7 @@ verify:
     - python3 mirror.py targets
     - python3 -m unittest discover -s tests -v
     # What sync would send next; sbom and scan check exactly these. The job token reads the ledger.
-    - MIRROR_LEDGER=true python3 mirror.py pending > pending.txt
+    - MIRROR_LEDGER=true python3 mirror.py pending $(case "$MIRROR_SEND" in none) echo --synced;; export) echo --carried;; esac) > pending.txt
     - cat pending.txt
   artifacts:
     paths: [pending.txt]
@@ -150,12 +152,20 @@ sync: &mirror
   script:
     - python3 mirror.py login
     - |
-      if [ "$RESEND_ALL" = "true" ]; then
+      if [ "$MIRROR_SEND" = "none" ]; then
+        python3 mirror.py sync --low-only
+      elif [ "$MIRROR_SEND" = "export" ]; then
+        python3 mirror.py carry --path "${MIRROR_SEND_PATH:?MIRROR_SEND=export needs MIRROR_SEND_PATH}" \
+          $([ "$RESEND_ALL" = "true" ] && echo --all)
+      elif [ "$RESEND_ALL" = "true" ]; then
         python3 mirror.py sync --all --out outbox
       else
         python3 mirror.py sync --out outbox
       fi
-    - python3 mirror.py send "$MIRROR_SEND" outbox ${MIRROR_SEND_PATH:+--path "$MIRROR_SEND_PATH"}
+    - |
+      if [ "$MIRROR_SEND" != "none" ] && [ "$MIRROR_SEND" != "export" ]; then
+        python3 mirror.py send "$MIRROR_SEND" outbox ${MIRROR_SEND_PATH:+--path "$MIRROR_SEND_PATH"}
+      fi
     # Keep each sent image's SBOM and scan report, by digest, for audit.
     - |
       for file in sbom/*.json; do
