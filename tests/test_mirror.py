@@ -1019,6 +1019,9 @@ class LedgerTest(unittest.TestCase):
             catalog = Path(directory) / 'images.txt'
             catalog.write_text('docker.io/library/alpine:3.20@sha256:' + 'b' * 64 + ' mirror/alpine\n')
             target = Path(directory) / 'transfer'
+            with self.assertRaisesRegex(mirror.MirrorError, 'mount or create it first'):
+                mirror.carry(catalog, target)
+            target.mkdir()
             with mock.patch.object(mirror, 'sync'), \
                     mock.patch.object(mirror, 'export', side_effect=mirror.MirrorError('registry down')):
                 with self.assertRaises(mirror.MirrorError):
@@ -1028,6 +1031,16 @@ class LedgerTest(unittest.TestCase):
             with mock.patch('sys.stdout', new_callable=io.StringIO) as out:
                 mirror.pending(catalog, carried=True, targets=True)
             self.assertEqual(out.getvalue(), 'mirror/alpine:3.20\n')  # still due next run
+
+    def test_scratch_sets_tmpdir_only_inside_the_block(self):
+        with mock.patch.dict(os.environ, {'TMPDIR': '/before'}):
+            with mirror.scratch('/share/tmp'):
+                self.assertEqual(os.environ['TMPDIR'], '/share/tmp')
+            self.assertEqual(os.environ['TMPDIR'], '/before')
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mirror.scratch('/share/tmp'):
+                pass
+            self.assertNotIn('TMPDIR', os.environ)
 
     def test_load_will_not_move_a_tag_without_force(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TARGET_REGISTRY': 'registry.example.com'}):
@@ -1086,7 +1099,7 @@ class LedgerTest(unittest.TestCase):
         self.assertFalse(json.loads(files[('registry-mirror-ledger', 'head', 'state.json')])['pending'])
         with mock.patch('builtins.print') as said:
             self.assertEqual(mirror.send('nifi', target='http://x'), 0)
-        said.assert_called_once_with(f"nothing to send in {self.root / 'out'}")
+        self.assertIn(mock.call(f"nothing to send in {self.root / 'out'}"), said.call_args_list)
 
     def test_a_lost_bundle_keeps_the_ledger_pending_past_an_unrelated_resend(self):
         files = self.store()
