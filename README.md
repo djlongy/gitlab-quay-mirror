@@ -119,13 +119,14 @@ place, and checks every file against its digest as before.
 
 ### Export and load
 
-For hand-carry, `export` copies images that are already in a registry into one directory, and optionally one tar with a `.sha256`. It does not sync, pull from upstream or touch the ledger, so it runs as fast as the registry and disk allow: sync first (`MIRROR_SEND=none` in the pipeline), export when you need a carry. Each image is a byte-for-byte `dir:` copy, so tags, digests and Docker manifest lists or OCI indexes are kept, and a layer shared by several images is hardlinked and stored once.
+For hand-carry, `export` copies images that are already in a registry into one tar, written where `--tar` says, with a `.sha256` beside it. It builds the tar in a working directory under `--staging` (default the current directory) and removes that directory once the tar is written, or if the export fails. `--out DIR` instead keeps the export unpacked, with no tar. A manual export is fresh every time: it exports exactly what you name, whatever the ledger says, so it is also how you resend one image the high side is missing. Only the pipeline (`carry`) dedupes against the ledger. It does not sync, pull from upstream or touch the ledger, so it runs as fast as the registry and disk allow: sync first (`MIRROR_SEND=none` in the pipeline), export when you need a carry. Each image is a byte-for-byte `dir:` copy, so tags, digests and Docker manifest lists or OCI indexes are kept, and a layer shared by several images is hardlinked and stored once.
 
 ```sh
-TARGET_REGISTRY=quay.low.example.com mirror.py export --out /share/export --tar /share/export.tar   # the catalog
-mirror.py export --out /share/export team/prometheus:v3.13.4 team/grafana       # in TARGET_REGISTRY: a tag, every tag
-mirror.py export --out /share/export quay.low.example.com/team/app:v1.2.3       # any registry, full reference
-mirror.py export --out /share/export --tar /share/carry.tar --list carry.txt    # a batch: one reference per line
+TARGET_REGISTRY=quay.low.example.com mirror.py export --tar /share/carry.tar     # the catalog
+mirror.py export --tar /share/carry.tar team/prometheus:v3.13.4 team/grafana      # in TARGET_REGISTRY: a tag, every tag
+mirror.py export --tar /share/carry.tar quay.low.example.com/team/app:v1.2.3      # any registry, full reference
+mirror.py export --tar /share/carry.tar --staging /share/tmp --list carry.txt     # a batch: one reference per line
+mirror.py export --out /share/export team/app:v1.2.3                              # no tar: keep it unpacked
 ```
 
 On the high side, `load` checks the tar against its `.sha256`, pushes every image to the same path in `TARGET_REGISTRY` and verifies each digest there. An image already present at its digest is skipped, so a rerun is cheap. A tag that points at a different digest is refused unless you pass `--force`.
@@ -140,7 +141,7 @@ An export is not a bundle: `import` does not read it, and it carries no sequence
 
 A registry that is neither `TARGET_REGISTRY` nor `SOURCE_REGISTRY` is read with TLS verified and the system trust store.
 
-sync, send, carry, export and load print the directories they write to before they start: work and ledger, outbox, staging, export, tar, skopeo scratch and where a tar unpacks. Each has a flag: `--state-dir` (any command), `sync --out`, `send --path`, `carry --path --staging`, `export --out --tar --tmp`, `load --scratch`.
+sync, send, carry, export and load print the directories they write to before they start: work and ledger, outbox, staging, export, tar, skopeo scratch and where a tar unpacks. Each has a flag: `--state-dir` (any command), `sync --out`, `send --path`, `carry --path --staging`, `export --tar --staging --out --tmp`, `load --scratch`.
 
 `--state-dir DIR` (any command) moves the work directory, staging and default outbox off `~/.local/state`, for a host whose home disk is small. `load` unpacks a tar into it, else beside the tar.
 
