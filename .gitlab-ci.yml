@@ -32,6 +32,9 @@ variables:
   # true: delta bundles leave out layers the high side already has (README, Blob delta).
   MIRROR_BLOB_DELTA: 'false'
   MIRROR_SEND_PATH: ''
+  # MIRROR_SEND=export: where the tar is built before it moves into MIRROR_SEND_PATH. Same filesystem.
+  # Empty: MIRROR_SEND_PATH/.staging. Every job prints the directories it writes to.
+  MIRROR_STAGING_PATH: ''
 
 verify:
   stage: verify
@@ -156,7 +159,7 @@ sync: &mirror
         python3 mirror.py sync --low-only
       elif [ "$MIRROR_SEND" = "export" ]; then
         python3 mirror.py carry --path "${MIRROR_SEND_PATH:?MIRROR_SEND=export needs MIRROR_SEND_PATH}" \
-          $([ "$RESEND_ALL" = "true" ] && echo --all)
+          ${MIRROR_STAGING_PATH:+--staging "$MIRROR_STAGING_PATH"} $([ "$RESEND_ALL" = "true" ] && echo --all)
       elif [ "$RESEND_ALL" = "true" ]; then
         python3 mirror.py sync --all --out outbox
       else

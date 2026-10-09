@@ -20,7 +20,8 @@ Flow: `SOURCE_REGISTRY` (Docker Hub, quay.io, ...) to the low `TARGET_REGISTRY` 
 | Required | `TARGET_REGISTRY_USERNAME`, `TARGET_REGISTRY_PASSWORD` | none | Account that can push; leave unset for a registry without auth |
 | Required | `MIRROR_SEND` | `none` | How images leave: `none` (sync `TARGET_REGISTRY` only; carry with [Export and load](#export-and-load) by hand), `export` (sync, then export what the run added as one tar into `MIRROR_SEND_PATH`), or bundles by `nifi`, `dir` or `s3`. See [Send](#send) |
 | `MIRROR_SEND=nifi` | `NIFI_URL` | none | NiFi ListenHTTP the bundles are posted to |
-| `MIRROR_SEND=dir` | `MIRROR_SEND_PATH` | none | Directory the low NiFi lists, e.g. an NFS share at `/mnt/transfer` mounted on the runner |
+| `MIRROR_SEND=export` or `dir` | `MIRROR_SEND_PATH` | none | Directory the low NiFi lists, e.g. an NFS share at `/mnt/transfer` mounted on the runner; it must exist |
+| `MIRROR_SEND=export` | `MIRROR_STAGING_PATH` | `MIRROR_SEND_PATH/.staging` | Where the tar is built before it moves into `MIRROR_SEND_PATH`; same filesystem |
 | `MIRROR_SEND=s3` | `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; optional `S3_PREFIX`, `S3_REGION`, `S3_CA_BUNDLE`, `S3_TLS_VERIFY` | none | The low-side bucket the low NiFi lists |
 | Optional | `TARGET_REGISTRY_TLS_VERIFY` | `true` | `false` only for a plain-HTTP lab registry |
 | Optional | `SOURCE_REGISTRY`, `SOURCE_REGISTRY_USERNAME`, `SOURCE_REGISTRY_PASSWORD`, `SOURCE_REGISTRY_TLS_VERIFY` | none | Login and TLS setting for one source registry, for example `docker.io` against rate limits; other source hosts pull anonymously with TLS verified |
@@ -133,11 +134,13 @@ On the high side, `load` checks the tar against its `.sha256`, pushes every imag
 TARGET_REGISTRY=quay.high.example.com mirror.py load /media/usb/export.tar
 ```
 
-With `MIRROR_SEND=export` the pipeline runs `mirror.py carry --path "$MIRROR_SEND_PATH"`: it syncs `TARGET_REGISTRY`, exports the catalog images not carried yet (every one with `RESEND_ALL=true`) as `mirror-export-<UTC time>-<pipeline>.tar` in `MIRROR_SEND_PATH/.staging`, then renames the tar and, last, its `.sha256` into `MIRROR_SEND_PATH`. `.staging` must be on the same filesystem, or carry refuses to start. The ledger records an image as carried only after both files are in place, so a failed run carries it again next time, and a failed run leaves nothing behind in `.staging`. A NiFi `ListFile` on that path therefore never sees half a file; set its **Recurse Subdirectories** to `false` so it does not list `.staging`. On the high side the tar lands wherever NiFi puts it, and `load` is run by hand.
+With `MIRROR_SEND=export` the pipeline runs `mirror.py carry --path "$MIRROR_SEND_PATH"`: it syncs `TARGET_REGISTRY`, exports the catalog images not carried yet (every one with `RESEND_ALL=true`) as `mirror-export-<UTC time>-<pipeline>.tar` in `MIRROR_SEND_PATH/.staging`, then renames the tar and, last, its `.sha256` into `MIRROR_SEND_PATH`. `MIRROR_STAGING_PATH` (`carry --staging`) puts the build directory elsewhere; it must be on the same filesystem as `MIRROR_SEND_PATH`, or carry refuses to start. The ledger records an image as carried only after both files are in place, so a failed run carries it again next time, and a failed run leaves nothing behind in `.staging`. A NiFi `ListFile` on that path therefore never sees half a file; set its **Recurse Subdirectories** to `false` so it does not list `.staging`. On the high side the tar lands wherever NiFi puts it, and `load` is run by hand.
 
 An export is not a bundle: `import` does not read it, and it carries no sequence or ledger state. The `.sha256` catches corruption in transit, not deliberate tampering, the same trust as any hand-carried media.
 
 A registry that is neither `TARGET_REGISTRY` nor `SOURCE_REGISTRY` is read with TLS verified and the system trust store.
+
+sync, send, carry, export and load print the directories they write to before they start: work and ledger, outbox, staging, export, tar, skopeo scratch and where a tar unpacks. Each has a flag: `--state-dir` (any command), `sync --out`, `send --path`, `carry --path --staging`, `export --out --tar --tmp`, `load --scratch`.
 
 `--state-dir DIR` (any command) moves the work directory, staging and default outbox off `~/.local/state`, for a host whose home disk is small. `load` unpacks a tar into it, else beside the tar.
 
